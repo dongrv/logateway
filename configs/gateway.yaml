@@ -1,0 +1,91 @@
+server:
+  listen_addr: ":8080"
+  read_timeout: 3s
+  write_timeout: 5s
+  max_body_bytes: 1048576
+  max_conns_per_ip: 100
+  global_rate_limit: 20000
+  ants_pool_size: 10000
+  backpressure: drop # drop | block | fallback
+
+auth:
+  enabled: true
+  timestamp_window: 300
+  nonce_ttl_seconds: 300
+  nonce_cache_size: 100000
+
+projects:
+  - name: actilogs
+    enabled: true
+    sinks:
+      - type: redis
+        config:
+          key: "queue:actilogs"
+          type: list
+          max_len: 1000000
+    rate_limit: 5000
+    max_body_bytes: 524288
+    auth_required: true
+    pipelines:
+      - type: field_add
+        config:
+          fields:
+            env: "production"
+            source: "actilogs"
+      - type: field_filter
+        config:
+          mode: exclude
+          fields: ["internal_token", "raw_password"]
+
+  - name: track
+    enabled: true
+    sinks:
+      - type: kafka
+        config:
+          topic: "track_logs"
+          partition_key: "UID"
+          compression: snappy
+    rate_limit: 3000
+    max_body_bytes: 524288
+    auth_required: true
+    pipelines:
+      - type: field_redact
+        config:
+          fields:
+            phone: "***"
+            email: "***"
+
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"
+    password: ""
+    db: 0
+    pool_size: 100
+    min_idle_conns: 10
+    dial_timeout: 5s
+    read_timeout: 3s
+    write_timeout: 3s
+
+  kafka:
+    brokers:
+      - "127.0.0.1:9092"
+    batch_size: 100
+    batch_timeout: 100ms
+
+pipeline:
+  max_depth: 10
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"
+
+wal:
+  enabled: true # set to true to enable disk fallback
+  dir: "data/wal"
+  max_segment_bytes: 67108864
+  max_segments: 10
+  sync_interval: 100ms
