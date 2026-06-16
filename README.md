@@ -222,6 +222,30 @@ curl http://localhost:8080/admin/pools
 | `enabled` | bool | `true` | 是否启用 Metrics |
 | `path` | string | `/metrics` | Metrics 暴露路径 |
 
+
+#### server.backpressure
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `backpressure` | string | `drop` | Channel 满时策略: `drop`（丢弃）/ `block`（阻塞等待）/ `fallback`（写磁盘 WAL）|
+
+#### wal
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `enabled` | bool | `false` | 是否启用 WAL 磁盘持久化 |
+| `dir` | string | `data/wal` | WAL 段文件目录 |
+| `max_segment_bytes` | int | `67108864` | 单个段文件最大字节数（64MB）|
+| `max_segments` | int | `10` | 最多保留段文件数 |
+| `sync_interval` | duration | `100ms` | 定期 fsync 间隔（0=每次写入都 sync）|
+
+#### sink_instances（可选）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `<name>.type` | string | Sink 类型: `redis` / `kafka` |
+| `<name>.config` | map | Sink 连接参数（字段与全局 `sinks` 相同，逐 key 覆写）|
+
 ### 配置示例
 
 <details>
@@ -296,6 +320,16 @@ metrics:
 </details>
 
 ---
+
+### Sink 配置模式（三层合并）
+
+每个项目的 Sink 最终配置由**三层浅合并**确定：
+1. **全局默认值**（`sinks.<type>`）
+2. **命名实例**（`sink_instances.<name>`，如果项目指定了 `instance`）
+3. **项目覆写**（项目 `config` 中的字段逐 key 覆盖上层）
+
+详细示例参考 `configs/gateway.yaml`，支持四种模式：内联、实例引用、双路投递、实例+覆写。
+
 
 ## API 接口
 

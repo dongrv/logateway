@@ -15,14 +15,15 @@ import (
 
 // Config is the top-level gateway configuration.
 type Config struct {
-	Server   ServerConfig    `yaml:"server"`
-	Auth     AuthConfig      `yaml:"auth"`
-	Projects []ProjectConfig `yaml:"projects"`
-	Sinks    SinksConfig     `yaml:"sinks"`
-	Pipeline PipelineConfig  `yaml:"pipeline"`
-	Log      LogConfig       `yaml:"log"`
-	Metrics  MetricsConfig   `yaml:"metrics"`
-	WAL      WALConfig       `yaml:"wal"`
+	Server        ServerConfig                  `yaml:"server"`
+	Auth          AuthConfig                    `yaml:"auth"`
+	Projects      []ProjectConfig               `yaml:"projects"`
+	Sinks         SinksConfig                   `yaml:"sinks"`
+	SinkInstances map[string]SinkInstanceConfig `yaml:"sink_instances"`
+	Pipeline      PipelineConfig                `yaml:"pipeline"`
+	Log           LogConfig                     `yaml:"log"`
+	Metrics       MetricsConfig                 `yaml:"metrics"`
+	WAL           WALConfig                     `yaml:"wal"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -34,7 +35,7 @@ type ServerConfig struct {
 	MaxConnsPerIP   int           `yaml:"max_conns_per_ip"`
 	GlobalRateLimit int           `yaml:"global_rate_limit"`
 	AntsPoolSize    int           `yaml:"ants_pool_size"`
-	Backpressure    string        `yaml:"backpressure"` // block | drop | fallback
+	Backpressure    string        `yaml:"backpressure"`
 }
 
 // AuthConfig holds authentication settings.
@@ -57,7 +58,18 @@ type ProjectConfig struct {
 }
 
 // SinkRef references a sink configuration for a project.
+// Supports three modes:
+//  1. Inline: type + config (merged with global defaults)
+//  2. Named instance: instance + optional config overrides
+//  3. Named instance with different type: instance + type (type from instance used)
 type SinkRef struct {
+	Type     string                 `yaml:"type"`
+	Instance string                 `yaml:"instance"`
+	Config   map[string]interface{} `yaml:"config"`
+}
+
+// SinkInstanceConfig defines a named, reusable sink instance.
+type SinkInstanceConfig struct {
 	Type   string                 `yaml:"type"`
 	Config map[string]interface{} `yaml:"config"`
 }
@@ -68,7 +80,7 @@ type PipelineRef struct {
 	Config map[string]interface{} `yaml:"config"`
 }
 
-// SinksConfig holds predefined sink configurations.
+// SinksConfig holds predefined sink configurations used as global defaults.
 type SinksConfig struct {
 	Redis RedisSinkConfig `yaml:"redis"`
 	Kafka KafkaSinkConfig `yaml:"kafka"`
@@ -149,7 +161,6 @@ func NewManager(configPath string) (*Manager, error) {
 }
 
 // OnReload registers a callback invoked after each successful config reload.
-// Must be called before Watch() to avoid races.
 func (m *Manager) OnReload(fn func(*Config)) {
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
@@ -323,5 +334,20 @@ func (m *Manager) applyDefaults(cfg *Config) {
 	}
 	if cfg.WAL.SyncInterval == 0 {
 		cfg.WAL.SyncInterval = 100 * time.Millisecond
+	}
+	if cfg.Sinks.Redis.MinIdleConns == 0 {
+		cfg.Sinks.Redis.MinIdleConns = 10
+	}
+	if cfg.Sinks.Redis.DialTimeout == 0 {
+		cfg.Sinks.Redis.DialTimeout = 5 * time.Second
+	}
+	if cfg.Sinks.Redis.ReadTimeout == 0 {
+		cfg.Sinks.Redis.ReadTimeout = 3 * time.Second
+	}
+	if cfg.Sinks.Redis.WriteTimeout == 0 {
+		cfg.Sinks.Redis.WriteTimeout = 3 * time.Second
+	}
+	if cfg.Sinks.Redis.PoolSize == 0 {
+		cfg.Sinks.Redis.PoolSize = 100
 	}
 }

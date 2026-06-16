@@ -69,8 +69,9 @@ func (d *Dispatcher) Initialize() error {
 func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	var pools []*sink.WorkerPool
 	for i, sr := range projCfg.Sinks {
-		sinkName := fmt.Sprintf("%s-%s-%d", projCfg.Name, sr.Type, i)
-		si, err := d.reg.Create(sr.Type, sinkName, sr.Config)
+		sinkType, mergedCfg := d.resolveSinkConfig(sr)
+		sinkName := fmt.Sprintf("%s-%s-%d", projCfg.Name, sinkType, i)
+		si, err := d.reg.Create(sinkType, sinkName, mergedCfg)
 		if err != nil {
 			return fmt.Errorf("create sink %s: %w", sinkName, err)
 		}
@@ -89,6 +90,84 @@ func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	d.pools[projCfg.Name] = pools
 	log.Printf("[INFO] initialized project %s with %d sinks (bp=%v)", projCfg.Name, len(pools), d.bp)
 	return nil
+}
+
+// resolveSinkConfig merges config from three layers:
+//  1. Global defaults (sinks.<type> section)
+//  2. Named sink instance (sink_instances.<name>), if ref.Instance is set
+//  3. Project-level config (ref.Config) — shallow override
+//
+// Returns the final sink type and merged config map.
+func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]interface{}) {
+	// Determine the sink type from: instance type > ref type
+	sinkType := ref.Type
+	if ref.Instance != "" {
+		instances := d.cfg.Get().SinkInstances
+		if inst, ok := instances[ref.Instance]; ok {
+			sinkType = inst.Type
+		} else {
+			log.Printf("[WARN] sink instance %q not found, falling back to type %q", ref.Instance, ref.Type)
+		}
+	}
+	if sinkType == "" {
+		sinkType = "redis" // ultimate fallback
+	}
+
+	// Layer 1: global defaults for this sink type
+	merged := d.globalSinkDefaults(sinkType)
+
+	// Layer 2: named instance config (deepens the merge before project override)
+	if ref.Instance != "" {
+		instances := d.cfg.Get().SinkInstances
+		if inst, ok := instances[ref.Instance]; ok {
+			for k, v := range inst.Config {
+				merged[k] = v
+			}
+		}
+	}
+
+	// Layer 3: project-level config overrides everything (shallow merge)
+	for k, v := range ref.Config {
+		merged[k] = v
+	}
+
+	return sinkType, merged
+}
+
+// globalSinkDefaults returns a map of default values from the sinks.<type> section.
+func (d *Dispatcher) globalSinkDefaults(sinkType string) map[string]interface{} {
+	cfg := d.cfg.Get()
+	switch sinkType {
+	case "redis":
+		return map[string]interface{}{
+			"addr":           cfg.Sinks.Redis.Addr,
+			"password":       cfg.Sinks.Redis.Password,
+			"db":             cfg.Sinks.Redis.DB,
+			"pool_size":      cfg.Sinks.Redis.PoolSize,
+			"min_idle_conns": cfg.Sinks.Redis.MinIdleConns,
+			"dial_timeout":   cfg.Sinks.Redis.DialTimeout.String(),
+			"read_timeout":   cfg.Sinks.Redis.ReadTimeout.String(),
+			"write_timeout":  cfg.Sinks.Redis.WriteTimeout.String(),
+			"key":            cfg.Sinks.Redis.Key,
+			"type":           cfg.Sinks.Redis.Type,
+			"max_len":        cfg.Sinks.Redis.MaxLen,
+		}
+	case "kafka":
+		brokers := make([]interface{}, len(cfg.Sinks.Kafka.Brokers))
+		for i, b := range cfg.Sinks.Kafka.Brokers {
+			brokers[i] = b
+		}
+		return map[string]interface{}{
+			"brokers":       brokers,
+			"topic":         cfg.Sinks.Kafka.Topic,
+			"partition_key": cfg.Sinks.Kafka.PartitionKey,
+			"compression":   cfg.Sinks.Kafka.Compression,
+			"batch_size":    cfg.Sinks.Kafka.BatchSize,
+			"batch_timeout": cfg.Sinks.Kafka.BatchTimeout.String(),
+		}
+	default:
+		return make(map[string]interface{})
+	}
 }
 
 // SinkInfos returns all sink instances for health check registration.
@@ -117,7 +196,6 @@ func (d *Dispatcher) Dispatch(msg *message.Message) error {
 		return fmt.Errorf("no sinks configured for project %s", msg.Project)
 	}
 
-	// Run pipelines if configured
 	projCfg := d.cfg.GetProject(msg.Project)
 	if projCfg != nil && len(projCfg.Pipelines) > 0 {
 		chain := d.buildPipelineChain(projCfg)

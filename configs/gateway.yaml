@@ -14,7 +14,55 @@ auth:
   nonce_ttl_seconds: 300
   nonce_cache_size: 100000
 
+# ── 全局 Sink 默认值（所有未显式覆盖的字段从这里继承） ──
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"
+    password: ""
+    db: 0
+    pool_size: 100
+    min_idle_conns: 10
+    dial_timeout: 5s
+    read_timeout: 3s
+    write_timeout: 3s
+
+  kafka:
+    brokers:
+      - "127.0.0.1:9092"
+    batch_size: 100
+    batch_timeout: 100ms
+
+# ── 命名 Sink 实例（多项目可共用） ──
+sink_instances:
+  redis_main:
+    type: redis
+    config:
+      addr: "redis-main:6379"
+      password: "${REDIS_MAIN_PASSWORD}"
+      pool_size: 200
+      min_idle_conns: 20
+      dial_timeout: 5s
+      read_timeout: 3s
+      write_timeout: 3s
+
+  redis_backup:
+    type: redis
+    config:
+      addr: "redis-backup:6379"
+      pool_size: 50
+      min_idle_conns: 5
+
+  kafka_prod:
+    type: kafka
+    config:
+      brokers: ["kafka1:9092", "kafka2:9092", "kafka3:9092"]
+      compression: snappy
+      batch_size: 200
+      batch_timeout: 50ms
+
+# ── 项目配置 ──
 projects:
+  # 用法 1: 内联配置（继承全局 sinks.redis，只覆写 key）
   - name: actilogs
     enabled: true
     sinks:
@@ -37,14 +85,15 @@ projects:
           mode: exclude
           fields: ["internal_token", "raw_password"]
 
+  # 用法 2: 引用命名实例 + 覆写部分字段
   - name: track
     enabled: true
     sinks:
-      - type: kafka
+      - instance: redis_main
         config:
-          topic: "track_logs"
-          partition_key: "UID"
-          compression: snappy
+          key: "queue:track"
+          type: list
+          db: 2 # 覆写实例的 db
     rate_limit: 3000
     max_body_bytes: 524288
     auth_required: true
@@ -55,22 +104,29 @@ projects:
             phone: "***"
             email: "***"
 
-sinks:
-  redis:
-    addr: "127.0.0.1:6379"
-    password: ""
-    db: 0
-    pool_size: 100
-    min_idle_conns: 10
-    dial_timeout: 5s
-    read_timeout: 3s
-    write_timeout: 3s
+  # 用法 3: 双路投递（同时写两个不同 Redis）
+  - name: orders
+    enabled: true
+    sinks:
+      - instance: redis_main
+        config:
+          key: "queue:orders"
+      - instance: redis_backup
+        config:
+          key: "queue:orders_backup"
+    rate_limit: 2000
+    auth_required: true
 
-  kafka:
-    brokers:
-      - "127.0.0.1:9092"
-    batch_size: 100
-    batch_timeout: 100ms
+  # 用法 4: 引用 Kafka 实例
+  - name: events
+    enabled: true
+    sinks:
+      - instance: kafka_prod
+        config:
+          topic: "events"
+          partition_key: "UID"
+    rate_limit: 5000
+    auth_required: true
 
 pipeline:
   max_depth: 10
@@ -84,7 +140,7 @@ metrics:
   path: "/metrics"
 
 wal:
-  enabled: true # set to true to enable disk fallback
+  enabled: false
   dir: "data/wal"
   max_segment_bytes: 67108864
   max_segments: 10
