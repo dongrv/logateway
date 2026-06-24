@@ -61,8 +61,14 @@ func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	for i, sr := range projCfg.Sinks {
 		sinkType, mergedCfg := d.resolveSinkConfig(sr)
 		sinkName := fmt.Sprintf("%s-%s-%d", projCfg.Name, sinkType, i)
-		workers := readPoolInt(mergedCfg, "workers", 16)
-		channelSize := readPoolInt(mergedCfg, "channel_size", 16384)
+		workers := sr.Workers
+		if workers <= 0 {
+			workers = readPoolInt(mergedCfg, "workers", 16)
+		}
+		channelSize := sr.ChannelSize
+		if channelSize <= 0 {
+			channelSize = readPoolInt(mergedCfg, "channel_size", 16384)
+		}
 		si, err := d.reg.Create(sinkType, sinkName, mergedCfg)
 		if err != nil {
 			return fmt.Errorf("create sink %s: %w", sinkName, err)

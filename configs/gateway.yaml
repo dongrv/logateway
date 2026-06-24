@@ -26,6 +26,21 @@ sinks:
     read_timeout: 3s
     write_timeout: 3s
 
+# ── 命名 Sink 实例（多项目可共用） ──
+sink_instances:
+  redis_main:
+    type: redis
+    workers: 16
+    channel_size: 65536
+    config:
+      addr: "127.0.0.1:6379"
+      password: ""
+      pool_size: 200
+      min_idle_conns: 20
+      dial_timeout: 5s
+      read_timeout: 3s
+      write_timeout: 3s
+
 projects:
   - name: actilogs
     enabled: true
@@ -43,6 +58,20 @@ projects:
         config:
           mode: exclude
           fields: ["internal_token", "raw_password"]
+  # 用法 2: 引用命名实例 + 覆写部分字段
+  - name: blogs
+    enabled: true
+    sinks:
+      - instance: redis_main
+        workers: 16
+        channel_size: 65536
+        config:
+          key: "queue:blogs"
+          type: list
+          #db: 2 # 覆写实例的 db
+    rate_limit: 10000
+    max_body_bytes: 524288
+    auth_required: true
 
 wal:
   enabled: true
