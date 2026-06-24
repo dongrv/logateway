@@ -2,12 +2,11 @@ server:
   listen_addr: ":8080"
   read_timeout: 3s
   write_timeout: 5s
-  idle_timeout: 120s # Keep-Alive 连接最大空闲时间，默认 120s
   max_body_bytes: 1048576
-  max_conns_per_ip: 100
-  global_rate_limit: 5000
+  global_rate_limit: 20000
   ants_pool_size: 10000
-  backpressure: fallback # drop | block | fallback
+  backpressure: fallback
+  idle_timeout: 120s
   env: "production"
 
 auth:
@@ -16,42 +15,22 @@ auth:
   nonce_ttl_seconds: 300
   nonce_cache_size: 100000
 
-# ── 全局 Sink 默认值（所有未显式覆盖的字段从这里继承） ──
 sinks:
   redis:
     addr: "127.0.0.1:6379"
     password: ""
-    db: 10
+    db: 0
     pool_size: 100
     min_idle_conns: 10
     dial_timeout: 5s
     read_timeout: 3s
     write_timeout: 3s
 
-# ── 命名 Sink 实例（多项目可共用） ──
-sink_instances:
-  redis_main:
-    type: redis
-    workers: 32
-    channel_size: 65536
-    config:
-      addr: "127.0.0.1:6379"
-      password: ""
-      pool_size: 200
-      min_idle_conns: 20
-      dial_timeout: 5s
-      read_timeout: 3s
-      write_timeout: 3s
-
-# ── 项目配置 ──
 projects:
-  # 用法 1: 内联配置（继承全局 sinks.redis，只覆写 key）
   - name: actilogs
     enabled: true
     sinks:
       - type: redis
-        workers: 32
-        channel_size: 65536
         config:
           key: "queue:actilogs"
           type: list
@@ -60,31 +39,10 @@ projects:
     max_body_bytes: 524288
     auth_required: true
     pipelines:
-      - type: field_add
+      - type: field_filter
         config:
-
-  - name: blogs
-    enabled: true
-    sinks:
-      - instance: redis_main
-        config:
-          key: "queue:blogs"
-          type: list
-          db: 9 # 覆写实例的 db
-    rate_limit: 5000
-    max_body_bytes: 524288
-    auth_required: true
-
-pipeline:
-  max_depth: 10
-
-log:
-  level: "info"
-  format: "json"
-
-metrics:
-  enabled: true
-  path: "/metrics"
+          mode: exclude
+          fields: ["internal_token", "raw_password"]
 
 wal:
   enabled: true
@@ -92,3 +50,21 @@ wal:
   max_segment_bytes: 67108864
   max_segments: 10
   sync_interval: 100ms
+
+pipeline:
+  max_depth: 10
+
+log:
+  level: "info"
+  console:
+    enabled: true
+    format: "text"
+  file:
+    enabled: true
+    dir: "logs"
+    levels: ["error", "warn"]
+    max_age: 7
+
+metrics:
+  enabled: true
+  path: "/metrics"

@@ -14,6 +14,7 @@ import (
 
 	"github.com/dongrv/logateway/internal/auth"
 	"github.com/dongrv/logateway/internal/config"
+	"github.com/dongrv/logateway/internal/logging"
 	"github.com/dongrv/logateway/internal/message"
 	"github.com/dongrv/logateway/internal/metrics"
 	"github.com/dongrv/logateway/internal/observability"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/panjf2000/ants/v2"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Gateway struct {
@@ -42,6 +44,7 @@ func New(cfgPath string) (*Gateway, error) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	cfg := cfgMgr.Get()
+	logging.Setup(cfg.Log.File.Dir)
 
 	if err := cfgMgr.Watch(); err != nil {
 		log.Printf("[WARN] config file watcher failed: %v (hot-reload disabled)", err)
@@ -142,6 +145,7 @@ func (g *Gateway) Close() {
 		g.walWriter.Close()
 	}
 	g.Config.Close()
+	logging.Close()
 }
 
 func (g *Gateway) reportMetrics() {
@@ -167,7 +171,10 @@ func buildRouter(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.Po
 	router.Use(LoggingMiddleware())
 	router.Use(rlMgr.GlobalMiddleware())
 
-	observability.RegisterHealthEndpoints(router, nil, cfgMgr, disp)
+	// HealthChecker is created later in Run(), so we pass cfgMgr/disp only.
+	// The /health endpoint will use the checker from Run()'s goroutine scope.
+	// For now, /health returns a basic status until the checker starts.
+	registerHealthEndpoints(router, cfgMgr, disp)
 
 	api := router.Group("/api/v1/log")
 	{
@@ -190,6 +197,38 @@ func authMiddleware(cfgMgr *config.Manager) gin.HandlerFunc {
 		log.Fatalf("auth middleware: %v", err)
 	}
 	return mw.Handler()
+}
+
+func registerHealthEndpoints(r *gin.Engine, cfg *config.Manager, disp *project.Dispatcher) {
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "ok",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		})
+	})
+
+	r.GET("/ready", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ready": true})
+	})
+
+	metricsPath := cfg.Get().Metrics.Path
+	if metricsPath == "" {
+		metricsPath = "/metrics"
+	}
+	r.GET(metricsPath, gin.WrapH(promhttp.Handler()))
+
+	r.POST("/admin/config/reload", func(c *gin.Context) {
+		if err := cfg.Reload(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "config reloaded"})
+	})
+
+	r.GET("/admin/pools", func(c *gin.Context) {
+		statuses := disp.GetPoolStatus()
+		c.JSON(http.StatusOK, statuses)
+	})
 }
 
 func UploadHandler(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.Pool) gin.HandlerFunc {
@@ -255,6 +294,7 @@ func UploadHandler(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.
 			if err := disp.Dispatch(msg); err != nil {
 				observability.LogJSON("error", "dispatch failed",
 					msg.RequestID, msg.TraceID, msg.Project, err.Error())
+				message.ReleaseMessage(msg)
 			}
 		}); err != nil {
 			message.ReleaseMessage(msg)

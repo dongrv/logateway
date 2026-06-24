@@ -118,8 +118,23 @@ type PipelineConfig struct {
 
 // LogConfig holds logging settings.
 type LogConfig struct {
-	Level  string `yaml:"level"`
-	Format string `yaml:"format"`
+	Level   string         `yaml:"level"`
+	Console ConsoleLogConf `yaml:"console"`
+	File    FileLogConf    `yaml:"file"`
+}
+
+// ConsoleLogConf controls console logging output.
+type ConsoleLogConf struct {
+	Enabled bool   `yaml:"enabled"`
+	Format  string `yaml:"format"`
+}
+
+// FileLogConf controls file-based logging output.
+type FileLogConf struct {
+	Enabled bool     `yaml:"enabled"`
+	Dir     string   `yaml:"dir"`
+	Levels  []string `yaml:"levels"`
+	MaxAge  int      `yaml:"max_age"`
 }
 
 // MetricsConfig holds metrics settings.
@@ -321,11 +336,14 @@ func (m *Manager) applyDefaults(cfg *Config) {
 		cfg.Server.GlobalRateLimit = 20000
 	}
 	if cfg.Server.Backpressure == "" {
-			cfg.Server.Backpressure = "drop"
-		}
-		if cfg.Server.IdleTimeout == 0 {
-			cfg.Server.IdleTimeout = 120 * time.Second
-		}
+		cfg.Server.Backpressure = "drop"
+	}
+	if cfg.Server.IdleTimeout == 0 {
+		cfg.Server.IdleTimeout = 120 * time.Second
+	}
+	if cfg.Log.File.Dir == "" {
+		cfg.Log.File.Dir = "logs"
+	}
 	if cfg.WAL.Dir == "" {
 		cfg.WAL.Dir = "data/wal"
 	}
