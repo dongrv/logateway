@@ -2,6 +2,7 @@
 
 [![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue)](https://go.dev/)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![DeepSeek](https://img.shields.io/badge/Powered%20by-DeepSeek%20V4%20Pro-536DFE)](https://deepseek.com)
 
 logateway 是一个高可用、高并发、可观测、可扩展的集中式 HTTP 消息网关，用于替代传统 PHP 日志接入层，作为所有日志类数据上报的统一入口。
 
