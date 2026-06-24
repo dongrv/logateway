@@ -106,7 +106,7 @@ curl http://localhost:8080/metrics
 |------|------|------|
 | `name` | string | 项目标识 |
 | `enabled` | bool | 是否启用 |
-| `rate_limit` | int | 项目级 QPS |
+| `rate_limit` | int | 项目级 QPS（与 `global_rate_limit` 取交集，实际上限为二者较小值） |
 | `max_body_bytes` | int | 项目级 Body 限制 |
 | `auth_required` | bool | 是否要求鉴权 |
 | `pipelines` | array | 处理器链 |
@@ -541,6 +541,10 @@ YAML 添加 project → `POST /admin/config/reload` 热重载（限流/鉴权生
 1. 提高 `workers`（默认 16）和 `channel_size`（默认 16384）
 2. 开启 `backpressure: fallback` + WAL
 3. 观察 `gateway_channel_usage_ratio`，持续 > 0.5 则继续扩容
+
+### 为什么配置了 `global_rate_limit: 30000` 还是触发 429？
+
+两层限流为 **AND（取交集）** 关系：请求需同时通过全局限流和项目级限流。如果项目级 `rate_limit: 5000`，即使全局设 30000，项目维度仍限制在 5000 QPS。压测或高吞吐场景需同时调高两层值。
 
 ### reload 会中断处理吗？
 

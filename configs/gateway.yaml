@@ -35,7 +35,7 @@ projects:
           key: "queue:actilogs"
           type: list
           max_len: 1000000
-    rate_limit: 5000
+    rate_limit: 10000
     max_body_bytes: 524288
     auth_required: true
     pipelines:
