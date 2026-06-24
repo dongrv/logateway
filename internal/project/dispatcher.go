@@ -1,5 +1,3 @@
-// Package project handles project resolution, message routing, and dispatching
-// to the appropriate sink worker pools.
 package project
 
 import (
@@ -15,13 +13,11 @@ import (
 	"github.com/dongrv/logateway/internal/wal"
 )
 
-// SinkInfo exposes a sink instance for health checking.
 type SinkInfo struct {
 	Name string
 	Sink sink.Sink
 }
 
-// Dispatcher resolves project configurations and routes messages to sink worker pools.
 type Dispatcher struct {
 	cfg         *config.Manager
 	reg         *sink.Registry
@@ -32,7 +28,6 @@ type Dispatcher struct {
 	bp          sink.Backpressure
 }
 
-// NewDispatcher creates a new project dispatcher.
 func NewDispatcher(cfg *config.Manager, reg *sink.Registry, walWriter *wal.Writer, bp sink.Backpressure) *Dispatcher {
 	return &Dispatcher{
 		cfg:         cfg,
@@ -44,16 +39,11 @@ func NewDispatcher(cfg *config.Manager, reg *sink.Registry, walWriter *wal.Write
 	}
 }
 
-// PipelineRegistry returns the pipeline processor registry for custom processor registration.
-func (d *Dispatcher) PipelineRegistry() *pipeline.Registry {
-	return d.pipelineReg
-}
+func (d *Dispatcher) PipelineRegistry() *pipeline.Registry { return d.pipelineReg }
 
-// Initialize creates worker pools for all enabled projects.
 func (d *Dispatcher) Initialize() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
 	cfg := d.cfg.Get()
 	for _, projCfg := range cfg.Projects {
 		if !projCfg.Enabled {
@@ -71,15 +61,16 @@ func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	for i, sr := range projCfg.Sinks {
 		sinkType, mergedCfg := d.resolveSinkConfig(sr)
 		sinkName := fmt.Sprintf("%s-%s-%d", projCfg.Name, sinkType, i)
+		workers := readPoolInt(mergedCfg, "workers", 16)
+		channelSize := readPoolInt(mergedCfg, "channel_size", 16384)
 		si, err := d.reg.Create(sinkType, sinkName, mergedCfg)
 		if err != nil {
 			return fmt.Errorf("create sink %s: %w", sinkName, err)
 		}
-
 		pool := sink.NewWorkerPool(sink.WorkerPoolConfig{
 			Sink:          si,
-			Workers:       4,
-			ChannelSize:   4096,
+			Workers:       workers,
+			ChannelSize:   channelSize,
 			MaxFails:      10,
 			Backpressure:  d.bp,
 			WALWriter:     d.walWriter,
@@ -92,14 +83,7 @@ func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	return nil
 }
 
-// resolveSinkConfig merges config from three layers:
-//  1. Global defaults (sinks.<type> section)
-//  2. Named sink instance (sink_instances.<name>), if ref.Instance is set
-//  3. Project-level config (ref.Config) — shallow override
-//
-// Returns the final sink type and merged config map.
 func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]interface{}) {
-	// Determine the sink type from: instance type > ref type
 	sinkType := ref.Type
 	if ref.Instance != "" {
 		instances := d.cfg.Get().SinkInstances
@@ -110,13 +94,11 @@ func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]i
 		}
 	}
 	if sinkType == "" {
-		sinkType = "redis" // ultimate fallback
+		sinkType = "redis"
 	}
 
-	// Layer 1: global defaults for this sink type
 	merged := d.globalSinkDefaults(sinkType)
 
-	// Layer 2: named instance config (deepens the merge before project override)
 	if ref.Instance != "" {
 		instances := d.cfg.Get().SinkInstances
 		if inst, ok := instances[ref.Instance]; ok {
@@ -126,7 +108,6 @@ func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]i
 		}
 	}
 
-	// Layer 3: project-level config overrides everything (shallow merge)
 	for k, v := range ref.Config {
 		merged[k] = v
 	}
@@ -134,7 +115,6 @@ func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]i
 	return sinkType, merged
 }
 
-// globalSinkDefaults returns a map of default values from the sinks.<type> section.
 func (d *Dispatcher) globalSinkDefaults(sinkType string) map[string]interface{} {
 	cfg := d.cfg.Get()
 	switch sinkType {
@@ -142,15 +122,15 @@ func (d *Dispatcher) globalSinkDefaults(sinkType string) map[string]interface{} 
 		return map[string]interface{}{
 			"addr":           cfg.Sinks.Redis.Addr,
 			"password":       cfg.Sinks.Redis.Password,
-			"db":             cfg.Sinks.Redis.DB,
-			"pool_size":      cfg.Sinks.Redis.PoolSize,
-			"min_idle_conns": cfg.Sinks.Redis.MinIdleConns,
+			"db":             float64(cfg.Sinks.Redis.DB),
+			"pool_size":      float64(cfg.Sinks.Redis.PoolSize),
+			"min_idle_conns": float64(cfg.Sinks.Redis.MinIdleConns),
 			"dial_timeout":   cfg.Sinks.Redis.DialTimeout.String(),
 			"read_timeout":   cfg.Sinks.Redis.ReadTimeout.String(),
 			"write_timeout":  cfg.Sinks.Redis.WriteTimeout.String(),
 			"key":            cfg.Sinks.Redis.Key,
 			"type":           cfg.Sinks.Redis.Type,
-			"max_len":        cfg.Sinks.Redis.MaxLen,
+			"max_len":        float64(cfg.Sinks.Redis.MaxLen),
 		}
 	case "kafka":
 		brokers := make([]interface{}, len(cfg.Sinks.Kafka.Brokers))
@@ -162,7 +142,7 @@ func (d *Dispatcher) globalSinkDefaults(sinkType string) map[string]interface{} 
 			"topic":         cfg.Sinks.Kafka.Topic,
 			"partition_key": cfg.Sinks.Kafka.PartitionKey,
 			"compression":   cfg.Sinks.Kafka.Compression,
-			"batch_size":    cfg.Sinks.Kafka.BatchSize,
+			"batch_size":    float64(cfg.Sinks.Kafka.BatchSize),
 			"batch_timeout": cfg.Sinks.Kafka.BatchTimeout.String(),
 		}
 	default:
@@ -170,11 +150,9 @@ func (d *Dispatcher) globalSinkDefaults(sinkType string) map[string]interface{} 
 	}
 }
 
-// SinkInfos returns all sink instances for health check registration.
 func (d *Dispatcher) SinkInfos() []SinkInfo {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-
 	var infos []SinkInfo
 	for _, pools := range d.pools {
 		for _, pool := range pools {
@@ -187,7 +165,10 @@ func (d *Dispatcher) SinkInfos() []SinkInfo {
 	return infos
 }
 
-// Dispatch routes a message to all configured sinks for the project asynchronously.
+// Dispatch routes a message to all configured sinks for the project.
+// For multi-sink projects, copies the message for each sink after the first
+// to avoid shared ownership. Worker pools are responsible for releasing
+// the message after processing.
 func (d *Dispatcher) Dispatch(msg *message.Message) error {
 	d.mu.RLock()
 	pools, ok := d.pools[msg.Project]
@@ -206,12 +187,37 @@ func (d *Dispatcher) Dispatch(msg *message.Message) error {
 		}
 	}
 
-	for _, pool := range pools {
-		if err := pool.Submit(msg); err != nil {
+	for i, pool := range pools {
+		var m *message.Message
+		if i == 0 {
+			m = msg // first pool owns the original message
+		} else {
+			m = copyMessage(msg) // subsequent pools get their own copy
+		}
+		if err := pool.Submit(m); err != nil {
+			message.ReleaseMessage(m)
 			return fmt.Errorf("submit to sink pool: %w", err)
 		}
 	}
 	return nil
+}
+
+func copyMessage(src *message.Message) *message.Message {
+	dst := message.AcquireMessage()
+	dst.RequestID = src.RequestID
+	dst.TraceID = src.TraceID
+	dst.Project = src.Project
+	dst.Router = src.Router
+	if len(src.Data) > 0 {
+		dst.Data = make([]byte, len(src.Data))
+		copy(dst.Data, src.Data)
+	}
+	dst.Timestamp = src.Timestamp
+	dst.Env = src.Env
+	for k, v := range src.Headers {
+		dst.Headers[k] = v
+	}
+	return dst
 }
 
 func (d *Dispatcher) buildPipelineChain(projCfg *config.ProjectConfig) *pipeline.Chain {
@@ -227,15 +233,13 @@ func (d *Dispatcher) buildPipelineChain(projCfg *config.ProjectConfig) *pipeline
 	return chain
 }
 
-// Shutdown gracefully shuts down all worker pools.
 func (d *Dispatcher) Shutdown() error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-
 	for name, pools := range d.pools {
 		for _, pool := range pools {
 			log.Printf("[INFO] shutting down worker pool for project %s", name)
-			if err := pool.Shutdown(0); err != nil {
+			if err := pool.Shutdown(10 * time.Second); err != nil {
 				log.Printf("[WARN] shutdown pool error: %v", err)
 			}
 		}
@@ -243,11 +247,9 @@ func (d *Dispatcher) Shutdown() error {
 	return nil
 }
 
-// GetPoolStatus returns a map of project -> channel usage ratios.
 func (d *Dispatcher) GetPoolStatus() map[string]float64 {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-
 	status := make(map[string]float64)
 	for name, pools := range d.pools {
 		var maxUsage float64
@@ -259,4 +261,16 @@ func (d *Dispatcher) GetPoolStatus() map[string]float64 {
 		status[name] = maxUsage
 	}
 	return status
+}
+
+func readPoolInt(cfg map[string]interface{}, key string, def int) int {
+	if v, ok := cfg[key]; ok {
+		switch val := v.(type) {
+		case float64:
+			return int(val)
+		case int:
+			return val
+		}
+	}
+	return def
 }

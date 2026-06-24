@@ -150,7 +150,7 @@ func NewRegistry() *Registry {
 
 func (r *Registry) registerBuiltins() {
 	r.Register("field_filter", func(cfg map[string]interface{}) (Processor, error) {
-		mode, _ := cfg["mode"].(string)
+		mode, ok := cfg["mode"].(string); if !ok { mode = "exclude" }
 		if mode != "include" && mode != "exclude" {
 			mode = "exclude"
 		}

@@ -197,5 +197,5 @@ func LogJSON(level, msg, requestID, traceID, project, errStr string) {
 			level, msg, requestID, traceID, project, errStr)
 		return
 	}
-	println(string(data))
+	log.Println(string(data))
 }

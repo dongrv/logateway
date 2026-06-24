@@ -1,0 +1,45 @@
+# 示例 3：Kafka 投递
+server:
+  listen_addr: ":8080"
+  backpressure: drop
+  ants_pool_size: 10000
+
+auth:
+  enabled: true
+  timestamp_window: 300
+
+sinks:
+  kafka:
+    brokers: ["kafka1:9092", "kafka2:9092"]
+    batch_size: 100
+    batch_timeout: 100ms
+
+projects:
+  - name: events
+    enabled: true
+    sinks:
+      - type: kafka
+        config:
+          topic: "events"
+          partition_key: "UID"
+          compression: snappy
+    rate_limit: 5000
+    auth_required: true
+    pipelines:
+      - type: field_add
+        config:
+          fields:
+            env: "production"
+      - type: field_redact
+        config:
+          fields:
+            phone: "***"
+            email: "***"
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"

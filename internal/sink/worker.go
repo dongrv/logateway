@@ -13,17 +13,14 @@ import (
 	"github.com/dongrv/logateway/internal/wal"
 )
 
-// Backpressure strategy determines behavior when the worker channel is full.
 type Backpressure int
 
 const (
-	BackpressureDrop     Backpressure = iota // drop the message (default)
-	BackpressureBlock                        // block with timeout
-	BackpressureFallback                     // write to disk WAL
+	BackpressureDrop Backpressure = iota
+	BackpressureBlock
+	BackpressureFallback
 )
 
-// WorkerPool manages a pool of goroutines that consume from a bounded channel
-// and deliver messages to a Sink.
 type WorkerPool struct {
 	sink    Sink
 	workers int
@@ -47,7 +44,6 @@ type WorkerPool struct {
 	shutdownOnce sync.Once
 }
 
-// WorkerPoolConfig configures a WorkerPool.
 type WorkerPoolConfig struct {
 	Sink          Sink
 	Workers       int
@@ -55,16 +51,15 @@ type WorkerPoolConfig struct {
 	MaxFails      int
 	Backpressure  Backpressure
 	WALWriter     *wal.Writer
-	SubmitTimeout time.Duration // for "block" strategy
+	SubmitTimeout time.Duration
 }
 
-// NewWorkerPool creates a new worker pool.
 func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 	if cfg.Workers <= 0 {
-		cfg.Workers = 4
+		cfg.Workers = 16
 	}
 	if cfg.ChannelSize <= 0 {
-		cfg.ChannelSize = 4096
+		cfg.ChannelSize = 16384
 	}
 	if cfg.MaxFails <= 0 {
 		cfg.MaxFails = 10
@@ -122,17 +117,10 @@ func (wp *WorkerPool) worker() {
 	for {
 		select {
 		case <-wp.ctx.Done():
-			for {
-				select {
-				case msg, ok := <-wp.ch:
-					if !ok {
-						return
-					}
-					wp.process(msg)
-				default:
-					return
-				}
+			for msg := range wp.ch {
+				wp.processDrain(msg)
 			}
+			return
 		case msg, ok := <-wp.ch:
 			if !ok {
 				return
@@ -143,6 +131,16 @@ func (wp *WorkerPool) worker() {
 }
 
 func (wp *WorkerPool) process(msg *message.Message) {
+	wp.processWithContext(msg, wp.ctx)
+}
+
+// processDrain processes messages during shutdown with a background context
+// so that the send timeout is not cancelled by the pool's own shutdown.
+func (wp *WorkerPool) processDrain(msg *message.Message) {
+	wp.processWithContext(msg, context.Background())
+}
+
+func (wp *WorkerPool) processWithContext(msg *message.Message, parentCtx context.Context) {
 	wp.mu.RLock()
 	open := wp.circuitOpen
 	wp.mu.RUnlock()
@@ -152,7 +150,7 @@ func (wp *WorkerPool) process(msg *message.Message) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(wp.ctx, 5*time.Second)
+	ctx, cancel := context.WithTimeout(parentCtx, 5*time.Second)
 	defer cancel()
 
 	var lastErr error
@@ -162,7 +160,7 @@ func (wp *WorkerPool) process(msg *message.Message) {
 			backoff := time.Duration(1<<uint(attempt)) * 100 * time.Millisecond
 			select {
 			case <-wp.ctx.Done():
-				message.ReleaseMessage(msg)
+				wp.handleRejected(msg, "shutdown_interrupt")
 				return
 			case <-time.After(backoff):
 			}
@@ -185,9 +183,10 @@ func (wp *WorkerPool) process(msg *message.Message) {
 	wp.handleRejected(msg, "send_failure")
 }
 
-// handleRejected deals with a message that cannot be delivered to the sink.
-// Strategy depends on the backpressure config: drop (default), or write to WAL.
 func (wp *WorkerPool) handleRejected(msg *message.Message, reason string) {
+	log.Printf("[WARN] sink %s message rejected: reason=%s request_id=%s bp=%d",
+		wp.sink.Name(), reason, msg.RequestID, wp.backpressure)
+
 	switch wp.backpressure {
 	case BackpressureFallback:
 		if wp.walWriter != nil {
@@ -195,11 +194,8 @@ func (wp *WorkerPool) handleRejected(msg *message.Message, reason string) {
 				log.Printf("[ERROR] wal fallback write failed: %v, request_id=%s", err, msg.RequestID)
 			} else {
 				wp.walFallbacks.Add(1)
-				log.Printf("[WARN] wal fallback: %s, request_id=%s", reason, msg.RequestID)
 			}
 		}
-	default: // drop
-		// already logged in process() or circuit open handler
 	}
 	message.ReleaseMessage(msg)
 }
@@ -226,10 +222,6 @@ func (wp *WorkerPool) resetFailures() {
 	wp.mu.Unlock()
 }
 
-// Submit enqueues a message for delivery. Returns error if the pool is closed,
-// or if the channel is full and backpressure is "block" with timeout.
-// For "drop" and "fallback" strategies, channel-full is not an error — the
-// message is handled internally (dropped or written to WAL).
 func (wp *WorkerPool) Submit(msg *message.Message) error {
 	wp.mu.RLock()
 	closed := wp.closed
@@ -247,10 +239,8 @@ func (wp *WorkerPool) Submit(msg *message.Message) error {
 	default:
 	}
 
-	// Channel full — apply backpressure strategy
 	switch bp {
 	case BackpressureBlock:
-		// Block with timeout
 		timer := time.NewTimer(timeout)
 		defer timer.Stop()
 		select {
@@ -261,44 +251,31 @@ func (wp *WorkerPool) Submit(msg *message.Message) error {
 			return fmt.Errorf("worker pool channel full (block timeout)")
 		}
 	case BackpressureFallback:
-		// Write to WAL and drop from memory
 		wp.handleRejected(msg, "channel_full")
-		return nil // success from caller's perspective (message is persisted)
-	default: // BackpressureDrop
+		return nil
+	default:
 		wp.handleRejected(msg, "channel_full")
 		return fmt.Errorf("worker pool channel full (dropped)")
 	}
 }
 
-// CircuitOpen returns whether the circuit breaker is open.
 func (wp *WorkerPool) CircuitOpen() bool {
 	wp.mu.RLock()
 	defer wp.mu.RUnlock()
 	return wp.circuitOpen
 }
 
-// Name returns the underlying sink name.
-func (wp *WorkerPool) Name() string {
-	return wp.sink.Name()
-}
+func (wp *WorkerPool) Name() string       { return wp.sink.Name() }
+func (wp *WorkerPool) SinkInstance() Sink { return wp.sink }
 
-// SinkInstance returns the underlying sink for health checks.
-func (wp *WorkerPool) SinkInstance() Sink {
-	return wp.sink
-}
-
-// ChannelUsage returns the current channel usage ratio (0.0 to 1.0).
 func (wp *WorkerPool) ChannelUsage() float64 {
 	return float64(len(wp.ch)) / float64(cap(wp.ch))
 }
 
-// WALFallbackCount returns the number of messages written to WAL fallback.
 func (wp *WorkerPool) WALFallbackCount() int64 {
 	return wp.walFallbacks.Load()
 }
 
-// Shutdown gracefully stops the worker pool.
-// Safe to call multiple times; only the first call takes effect.
 func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 	var err error
 	wp.shutdownOnce.Do(func() {
@@ -306,8 +283,11 @@ func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 		wp.closed = true
 		wp.mu.Unlock()
 
+		// 1. Cancel context — wakes workers blocked in retry backoff
 		wp.cancel()
+		// 2. Stop metrics reporter
 		close(wp.metricsStop)
+		// 3. Close channel — workers' for-range exits after draining
 		close(wp.ch)
 
 		done := make(chan struct{})

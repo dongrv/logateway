@@ -1,0 +1,47 @@
+# 示例 6：限流与反压策略
+server:
+  listen_addr: ":8080"
+  global_rate_limit: 20000    # 全局 QPS 上限
+  backpressure: block         # 超出时阻塞 100ms 而非直接丢弃
+  ants_pool_size: 15000
+
+auth:
+  enabled: true
+  timestamp_window: 300
+
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"
+
+projects:
+  # 低优先级项目 — 严格限流
+  - name: low_priority
+    enabled: true
+    sinks:
+      - type: redis
+        config:
+          key: "queue:low"
+          type: list
+    rate_limit: 500            # 每秒最多 500 条
+    max_body_bytes: 262144     # 256KB
+    auth_required: false       # 内网无需鉴权
+
+  # 高优先级项目 — 宽松限制
+  - name: high_priority
+    enabled: true
+    sinks:
+      - type: redis
+        config:
+          key: "queue:high"
+          type: list
+    rate_limit: 10000
+    max_body_bytes: 1048576
+    auth_required: true
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"

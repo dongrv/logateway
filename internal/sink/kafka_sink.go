@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"time"
 
@@ -11,14 +12,12 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// KafkaSink delivers messages to Kafka.
 type KafkaSink struct {
 	name         string
 	writer       *kafka.Writer
 	partitionKey string
 }
 
-// KafkaConfig holds configuration for Kafka sink.
 type KafkaConfig struct {
 	Brokers      []string
 	Topic        string
@@ -28,7 +27,6 @@ type KafkaConfig struct {
 	BatchTimeout time.Duration
 }
 
-// NewKafkaSink creates a new Kafka sink.
 func NewKafkaSink(name string, cfg KafkaConfig) (*KafkaSink, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("kafka brokers required")
@@ -71,12 +69,8 @@ func NewKafkaSink(name string, cfg KafkaConfig) (*KafkaSink, error) {
 	}, nil
 }
 
-// Name returns the sink name.
-func (s *KafkaSink) Name() string {
-	return s.name
-}
+func (s *KafkaSink) Name() string { return s.name }
 
-// Send delivers a message to Kafka.
 func (s *KafkaSink) Send(ctx context.Context, msg *message.Message) error {
 	envelope := buildEnvelope(msg)
 	data, err := json.Marshal(envelope)
@@ -93,9 +87,6 @@ func (s *KafkaSink) Send(ctx context.Context, msg *message.Message) error {
 	})
 }
 
-// partitionKeyBytes extracts the partition key from message data.
-// Uses the configured PartitionKey field name if set; otherwise falls back to
-// common key fields (UID/uid/user_id) and finally to RequestID.
 func (s *KafkaSink) partitionKeyBytes(msg *message.Message) []byte {
 	if len(msg.Data) == 0 {
 		return []byte(msg.RequestID)
@@ -106,14 +97,12 @@ func (s *KafkaSink) partitionKeyBytes(msg *message.Message) []byte {
 		return []byte(msg.RequestID)
 	}
 
-	// Use configured partition key field if set
 	if s.partitionKey != "" {
 		if v, ok := data[s.partitionKey]; ok {
 			return []byte(fmt.Sprint(v))
 		}
 	}
 
-	// Fallback to common fields
 	for _, field := range []string{"UID", "uid", "user_id", "UserID"} {
 		if v, ok := data[field]; ok {
 			return []byte(fmt.Sprint(v))
@@ -123,12 +112,10 @@ func (s *KafkaSink) partitionKeyBytes(msg *message.Message) []byte {
 	return []byte(msg.RequestID)
 }
 
-// HealthCheck verifies Kafka connectivity by trying to connect to any broker.
 func (s *KafkaSink) HealthCheck() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Dial any broker to check connectivity
 	addr := s.writer.Addr.String()
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -138,12 +125,10 @@ func (s *KafkaSink) HealthCheck() error {
 	return nil
 }
 
-// Close closes the Kafka producer.
 func (s *KafkaSink) Close() error {
 	return s.writer.Close()
 }
 
-// KafkaSinkFactory creates KafkaSink instances from config maps.
 func KafkaSinkFactory(name string, rawCfg map[string]interface{}) (Sink, error) {
 	cfg := KafkaConfig{
 		BatchSize:    100,
@@ -155,9 +140,13 @@ func KafkaSinkFactory(name string, rawCfg map[string]interface{}) (Sink, error) 
 				cfg.Brokers = append(cfg.Brokers, s)
 			}
 		}
+	} else if _, exists := rawCfg["brokers"]; exists {
+		log.Printf("[WARN] kafka factory: brokers has unexpected type %T", rawCfg["brokers"])
 	}
 	if v, ok := rawCfg["topic"].(string); ok {
 		cfg.Topic = v
+	} else if _, exists := rawCfg["topic"]; exists {
+		log.Printf("[WARN] kafka factory: topic has unexpected type %T", rawCfg["topic"])
 	}
 	if v, ok := rawCfg["partition_key"].(string); ok {
 		cfg.PartitionKey = v
@@ -165,12 +154,14 @@ func KafkaSinkFactory(name string, rawCfg map[string]interface{}) (Sink, error) 
 	if v, ok := rawCfg["compression"].(string); ok {
 		cfg.Compression = v
 	}
-	if v, ok := rawCfg["batch_size"].(float64); ok {
-		cfg.BatchSize = int(v)
-	}
+	cfg.BatchSize = intConfig(rawCfg, "batch_size", cfg.BatchSize)
 	if v, ok := rawCfg["batch_timeout"].(string); ok {
-		d, _ := time.ParseDuration(v)
-		cfg.BatchTimeout = d
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Printf("[WARN] kafka factory: invalid batch_timeout %q: %v", v, err)
+		} else {
+			cfg.BatchTimeout = d
+		}
 	}
 	return NewKafkaSink(name, cfg)
 }

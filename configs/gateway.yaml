@@ -2,11 +2,13 @@ server:
   listen_addr: ":8080"
   read_timeout: 3s
   write_timeout: 5s
+  idle_timeout: 120s # Keep-Alive 连接最大空闲时间，默认 120s
   max_body_bytes: 1048576
   max_conns_per_ip: 100
-  global_rate_limit: 20000
+  global_rate_limit: 5000
   ants_pool_size: 10000
-  backpressure: drop # drop | block | fallback
+  backpressure: fallback # drop | block | fallback
+  env: "production"
 
 auth:
   enabled: true
@@ -19,18 +21,27 @@ sinks:
   redis:
     addr: "127.0.0.1:6379"
     password: ""
-    db: 0
+    db: 10
     pool_size: 100
     min_idle_conns: 10
     dial_timeout: 5s
     read_timeout: 3s
     write_timeout: 3s
 
-  kafka:
-    brokers:
-      - "127.0.0.1:9092"
-    batch_size: 100
-    batch_timeout: 100ms
+# ── 命名 Sink 实例（多项目可共用） ──
+sink_instances:
+  redis_main:
+    type: redis
+    workers: 32
+    channel_size: 65536
+    config:
+      addr: "127.0.0.1:6379"
+      password: ""
+      pool_size: 200
+      min_idle_conns: 20
+      dial_timeout: 5s
+      read_timeout: 3s
+      write_timeout: 3s
 
 # ── 项目配置 ──
 projects:
@@ -39,6 +50,8 @@ projects:
     enabled: true
     sinks:
       - type: redis
+        workers: 32
+        channel_size: 65536
         config:
           key: "queue:actilogs"
           type: list
@@ -49,13 +62,18 @@ projects:
     pipelines:
       - type: field_add
         config:
-          fields:
-            env: "production"
-            source: "actilogs"
-      - type: field_filter
+
+  - name: blogs
+    enabled: true
+    sinks:
+      - instance: redis_main
         config:
-          mode: exclude
-          fields: ["internal_token", "raw_password"]
+          key: "queue:blogs"
+          type: list
+          db: 9 # 覆写实例的 db
+    rate_limit: 5000
+    max_body_bytes: 524288
+    auth_required: true
 
 pipeline:
   max_depth: 10
@@ -69,7 +87,7 @@ metrics:
   path: "/metrics"
 
 wal:
-  enabled: false
+  enabled: true
   dir: "data/wal"
   max_segment_bytes: 67108864
   max_segments: 10

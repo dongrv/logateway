@@ -1,0 +1,54 @@
+# 示例 4：Pipeline 处理器链
+# 展示 field_filter / field_add / field_redact 的完整用法
+server:
+  listen_addr: ":8080"
+  backpressure: drop
+  ants_pool_size: 10000
+
+auth:
+  enabled: true
+  timestamp_window: 300
+
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"
+
+projects:
+  - name: analytics
+    enabled: true
+    sinks:
+      - type: redis
+        config:
+          key: "queue:analytics"
+          type: list
+    rate_limit: 5000
+    auth_required: true
+    pipelines:
+      # 第一步：注入环境标识
+      - type: field_add
+        config:
+          fields:
+            env: "production"
+            gateway_version: "1.0.0"
+
+      # 第二步：脱敏用户隐私字段
+      - type: field_redact
+        config:
+          fields:
+            phone: "***"
+            id_card: "****"
+            bank_account: "[REDACTED]"
+
+      # 第三步：删除不需要的内部字段
+      - type: field_filter
+        config:
+          mode: exclude
+          fields: ["session_token", "debug_info", "raw_body"]
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"

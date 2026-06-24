@@ -2,6 +2,7 @@ server:
   listen_addr: ":8080"
   read_timeout: 3s
   write_timeout: 5s
+  idle_timeout: 120s # Keep-Alive 连接最大空闲时间，默认 120s
   max_body_bytes: 1048576
   max_conns_per_ip: 100
   global_rate_limit: 20000

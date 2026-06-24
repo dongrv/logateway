@@ -1,0 +1,44 @@
+# 示例 1：最简配置 — 单 Redis，内联模式
+# 使用全局 sinks.redis 默认值，项目只覆写 key 和 type
+server:
+  listen_addr: ":8080"
+  read_timeout: 3s
+  write_timeout: 5s
+  max_body_bytes: 1048576
+  global_rate_limit: 20000
+  ants_pool_size: 10000
+  backpressure: drop
+
+auth:
+  enabled: true
+  timestamp_window: 300
+  nonce_ttl_seconds: 300
+  nonce_cache_size: 100000
+
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"
+    pool_size: 100
+    min_idle_conns: 10
+    dial_timeout: 5s
+    read_timeout: 3s
+    write_timeout: 3s
+
+projects:
+  - name: actilogs
+    enabled: true
+    sinks:
+      - type: redis
+        config:
+          key: "queue:actilogs"
+          type: list
+    rate_limit: 5000
+    auth_required: true
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"

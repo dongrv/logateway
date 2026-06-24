@@ -1,0 +1,39 @@
+# 示例 5：WAL 磁盘兜底 — 消息不丢失
+server:
+  listen_addr: ":8080"
+  backpressure: fallback      # channel 满时写磁盘而非丢弃
+  ants_pool_size: 10000
+
+auth:
+  enabled: true
+  timestamp_window: 300
+
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"
+
+wal:
+  enabled: true
+  dir: "data/wal"             # WAL 段文件目录
+  max_segment_bytes: 67108864 # 64MB 自动轮转
+  max_segments: 10            # 最多保留 10 个段文件
+  sync_interval: 100ms        # 每 100ms fsync 一次
+
+projects:
+  - name: critical_logs
+    enabled: true
+    sinks:
+      - type: redis
+        config:
+          key: "queue:critical"
+          type: list
+    rate_limit: 1000
+    auth_required: true
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"

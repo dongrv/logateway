@@ -1,0 +1,71 @@
+# 示例 2：命名实例模式 — 多个 Redis，项目绑定到指定实例
+server:
+  listen_addr: ":8080"
+  backpressure: drop
+  ants_pool_size: 10000
+
+auth:
+  enabled: true
+  timestamp_window: 300
+
+sinks:
+  redis:
+    addr: "127.0.0.1:6379"       # 全局默认（未被实例覆写时生效）
+    pool_size: 100
+    min_idle_conns: 10
+
+# 两个独立的 Redis 实例
+sink_instances:
+  redis_main:
+    type: redis
+    config:
+      addr: "redis-prod:6379"
+      password: "${REDIS_MAIN_PWD}"
+      pool_size: 200
+      min_idle_conns: 20
+      db: 0
+
+  redis_backup:
+    type: redis
+    config:
+      addr: "redis-dr:6379"
+      password: "${REDIS_BACKUP_PWD}"
+      pool_size: 50
+      db: 0
+
+projects:
+  # orders 双路投递 — 同时写主备
+  - name: orders
+    enabled: true
+    sinks:
+      - instance: redis_main
+        config:
+          key: "queue:orders"
+          type: list
+      - instance: redis_backup
+        config:
+          key: "queue:orders_backup"
+          type: list
+    rate_limit: 2000
+    auth_required: true
+
+  # track 绑定到主 Redis
+  - name: track
+    enabled: true
+    sinks:
+      - instance: redis_main
+        config:
+          key: "queue:track"
+          type: stream
+          max_len: 500000
+          db: 2          # 覆写实例的 db
+    rate_limit: 3000
+    auth_required: true
+
+log:
+  level: "info"
+  format: "json"
+
+metrics:
+  enabled: true
+  path: "/metrics"

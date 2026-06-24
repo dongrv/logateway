@@ -23,28 +23,23 @@ import (
 
 // Config holds WAL configuration.
 type Config struct {
-	// Dir is the directory where WAL segment files are stored.
-	Dir string
-	// MaxSegmentBytes is the maximum size of a single segment file before rotation.
+	Dir             string
 	MaxSegmentBytes int64
-	// MaxSegments is the maximum number of segment files to retain.
-	MaxSegments int
-	// SyncInterval is how often to fsync the active segment to disk.
-	// Zero means sync after every write.
-	SyncInterval time.Duration
+	MaxSegments     int
+	SyncInterval    time.Duration
 }
 
 // DefaultConfig returns a Config with safe defaults.
 func DefaultConfig() Config {
 	return Config{
 		Dir:             "data/wal",
-		MaxSegmentBytes: 64 << 20, // 64MB
+		MaxSegmentBytes: 64 << 20,
 		MaxSegments:     10,
 		SyncInterval:    100 * time.Millisecond,
 	}
 }
 
-// Entry is a single record in the WAL, wrapping the delivered Envelope.
+// Entry is a single record in the WAL.
 type Entry struct {
 	Sequence  uint64          `json:"seq"`
 	Project   string          `json:"project"`
@@ -70,6 +65,7 @@ type Writer struct {
 
 	stopCh     chan struct{}
 	syncTicker *time.Ticker
+	closeOnce  sync.Once
 }
 
 // NewWriter creates or opens a WAL writer.
@@ -94,12 +90,10 @@ func NewWriter(cfg Config) (*Writer, error) {
 		stopCh: make(chan struct{}),
 	}
 
-	// Find the highest existing segment number and resume from it
 	if err := w.openLatest(); err != nil {
 		return nil, fmt.Errorf("wal open: %w", err)
 	}
 
-	// Start periodic fsync
 	if cfg.SyncInterval > 0 {
 		w.syncTicker = time.NewTicker(cfg.SyncInterval)
 		go w.syncLoop()
@@ -119,14 +113,12 @@ func (w *Writer) Write(entry Entry) error {
 	}
 	data = append(data, '\n')
 
-	// Rotate if needed
 	if w.activeSeg != nil && w.activeSize+int64(len(data)) > w.cfg.MaxSegmentBytes {
 		if err := w.rotate(); err != nil {
 			return fmt.Errorf("wal rotate: %w", err)
 		}
 	}
 
-	// Open first segment if none active
 	if w.activeSeg == nil {
 		if err := w.rotate(); err != nil {
 			return fmt.Errorf("wal initial rotate: %w", err)
@@ -140,7 +132,6 @@ func (w *Writer) Write(entry Entry) error {
 	w.activeSize += int64(n)
 	w.seq++
 
-	// Immediate fsync if no periodic sync configured
 	if w.cfg.SyncInterval == 0 {
 		if err := w.activeBuf.Flush(); err != nil {
 			return fmt.Errorf("wal flush: %w", err)
@@ -153,10 +144,10 @@ func (w *Writer) Write(entry Entry) error {
 	return nil
 }
 
-// WriteMessage is a convenience method that converts a Message to a WAL Entry and writes it.
+// WriteMessage converts a Message to a WAL Entry and writes it.
 func (w *Writer) WriteMessage(msg *message.Message) error {
 	return w.Write(Entry{
-		Sequence:  0, // set in Write
+		Sequence:  0,
 		Project:   msg.Project,
 		Router:    msg.Router,
 		Data:      msg.Data,
@@ -167,7 +158,6 @@ func (w *Writer) WriteMessage(msg *message.Message) error {
 }
 
 func (w *Writer) rotate() error {
-	// Flush and close current segment
 	if w.activeSeg != nil {
 		if err := w.activeBuf.Flush(); err != nil {
 			return err
@@ -180,7 +170,6 @@ func (w *Writer) rotate() error {
 		}
 	}
 
-	// Create new segment
 	segNum := w.nextSegmentNum()
 	name := fmt.Sprintf("wal-%06d.log", segNum)
 	path := filepath.Join(w.dir, name)
@@ -191,13 +180,11 @@ func (w *Writer) rotate() error {
 	}
 
 	w.activeSeg = f
-	w.activeBuf = bufio.NewWriterSize(f, 64<<10) // 64KB buffer
+	w.activeBuf = bufio.NewWriterSize(f, 64<<10)
 	w.activeSize = 0
 	w.activeName = name
 
-	// Enforce max segments retention
 	w.purgeOldSegments()
-
 	return nil
 }
 
@@ -244,7 +231,7 @@ func (w *Writer) openLatest() error {
 	}
 
 	if latest == "" {
-		return nil // no existing segments, will create on first write
+		return nil
 	}
 
 	path := filepath.Join(w.dir, latest)
@@ -253,7 +240,6 @@ func (w *Writer) openLatest() error {
 		return fmt.Errorf("wal open segment %s: %w", latest, err)
 	}
 
-	// Determine current size to know when to rotate
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
@@ -294,7 +280,6 @@ func (w *Writer) purgeOldSegments() {
 		return
 	}
 
-	// Sort by segment number ascending, delete oldest
 	sort.Slice(segments, func(i, j int) bool {
 		return segments[i].num < segments[j].num
 	})
@@ -331,28 +316,29 @@ func (w *Writer) syncLoop() {
 }
 
 // Close flushes and closes the active segment.
+// Safe to call on nil receiver (returns nil).
+// Idempotent — safe to call multiple times.
 func (w *Writer) Close() error {
-	close(w.stopCh)
-	if w.syncTicker != nil {
-		w.syncTicker.Stop()
+	if w == nil {
+		return nil
 	}
+	w.closeOnce.Do(func() {
+		close(w.stopCh)
+		if w.syncTicker != nil {
+			w.syncTicker.Stop()
+		}
 
-	w.mu.Lock()
-	defer w.mu.Unlock()
+		w.mu.Lock()
+		defer w.mu.Unlock()
 
-	if w.activeSeg != nil {
-		if err := w.activeBuf.Flush(); err != nil {
-			return fmt.Errorf("wal close flush: %w", err)
+		if w.activeSeg != nil {
+			_ = w.activeBuf.Flush()
+			_ = w.activeSeg.Sync()
+			_ = w.activeSeg.Close()
+			w.activeSeg = nil
+			w.activeBuf = nil
 		}
-		if err := w.activeSeg.Sync(); err != nil {
-			return fmt.Errorf("wal close sync: %w", err)
-		}
-		if err := w.activeSeg.Close(); err != nil {
-			return fmt.Errorf("wal close: %w", err)
-		}
-		w.activeSeg = nil
-		w.activeBuf = nil
-	}
+	})
 	return nil
 }
 
@@ -381,7 +367,6 @@ func (w *Writer) ActiveSegmentSize() int64 {
 // ---------- Reader (replay) ----------
 
 // ReadAll reads all WAL entries from all segment files, ordered by sequence.
-// Returns a channel that yields entries. The caller must drain the channel.
 func ReadAll(dir string) (<-chan Entry, <-chan error) {
 	entryCh := make(chan Entry, 256)
 	errCh := make(chan error, 1)
@@ -393,13 +378,12 @@ func ReadAll(dir string) (<-chan Entry, <-chan error) {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				return // no WAL directory, nothing to replay
+				return
 			}
 			errCh <- fmt.Errorf("wal read dir: %w", err)
 			return
 		}
 
-		// Collect and sort segment files by number
 		type segFile struct {
 			path string
 			num  int
@@ -444,7 +428,7 @@ func readSegment(path string, out chan<- Entry) error {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1<<20), 10<<20) // 10MB max line
+	scanner.Buffer(make([]byte, 0, 1<<20), 10<<20)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -463,7 +447,6 @@ func readSegment(path string, out chan<- Entry) error {
 		return fmt.Errorf("wal scan: %w", err)
 	}
 
-	// After successful replay, delete the segment
 	if err := os.Remove(path); err != nil {
 		log.Printf("[WARN] wal remove replayed segment %s: %v", path, err)
 	}

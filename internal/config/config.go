@@ -36,6 +36,8 @@ type ServerConfig struct {
 	GlobalRateLimit int           `yaml:"global_rate_limit"`
 	AntsPoolSize    int           `yaml:"ants_pool_size"`
 	Backpressure    string        `yaml:"backpressure"`
+	IdleTimeout     time.Duration `yaml:"idle_timeout"`
+	Env             string        `yaml:"env"`
 }
 
 // AuthConfig holds authentication settings.
@@ -58,14 +60,12 @@ type ProjectConfig struct {
 }
 
 // SinkRef references a sink configuration for a project.
-// Supports three modes:
-//  1. Inline: type + config (merged with global defaults)
-//  2. Named instance: instance + optional config overrides
-//  3. Named instance with different type: instance + type (type from instance used)
 type SinkRef struct {
-	Type     string                 `yaml:"type"`
-	Instance string                 `yaml:"instance"`
-	Config   map[string]interface{} `yaml:"config"`
+	Type        string                 `yaml:"type"`
+	Instance    string                 `yaml:"instance"`
+	Workers     int                    `yaml:"workers"`
+	ChannelSize int                    `yaml:"channel_size"`
+	Config      map[string]interface{} `yaml:"config"`
 }
 
 // SinkInstanceConfig defines a named, reusable sink instance.
@@ -321,8 +321,11 @@ func (m *Manager) applyDefaults(cfg *Config) {
 		cfg.Server.GlobalRateLimit = 20000
 	}
 	if cfg.Server.Backpressure == "" {
-		cfg.Server.Backpressure = "drop"
-	}
+			cfg.Server.Backpressure = "drop"
+		}
+		if cfg.Server.IdleTimeout == 0 {
+			cfg.Server.IdleTimeout = 120 * time.Second
+		}
 	if cfg.WAL.Dir == "" {
 		cfg.WAL.Dir = "data/wal"
 	}
