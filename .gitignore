@@ -34,5 +34,4 @@ go.work.sum
 logs/
 
 # agent
-.codex
-.claude
+.agent
