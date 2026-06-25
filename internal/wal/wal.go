@@ -48,6 +48,7 @@ type Entry struct {
 	RequestID string          `json:"request_id"`
 	TraceID   string          `json:"trace_id"`
 	Timestamp time.Time       `json:"timestamp"`
+	Env       string          `json:"env,omitempty"`
 }
 
 // Writer appends message entries to disk-based segment files.
@@ -66,6 +67,9 @@ type Writer struct {
 	stopCh     chan struct{}
 	syncTicker *time.Ticker
 	closeOnce  sync.Once
+
+	replayOnce sync.Once
+	replayStop chan struct{}
 }
 
 // NewWriter creates or opens a WAL writer.
@@ -154,6 +158,7 @@ func (w *Writer) WriteMessage(msg *message.Message) error {
 		RequestID: msg.RequestID,
 		TraceID:   msg.TraceID,
 		Timestamp: msg.Timestamp,
+		Env:       msg.Env,
 	})
 }
 
@@ -324,6 +329,9 @@ func (w *Writer) Close() error {
 	}
 	w.closeOnce.Do(func() {
 		close(w.stopCh)
+		if w.replayStop != nil {
+			close(w.replayStop)
+		}
 		if w.syncTicker != nil {
 			w.syncTicker.Stop()
 		}
@@ -357,7 +365,139 @@ func (w *Writer) SegmentCount() int {
 	return count
 }
 
-// ActiveSegmentSize returns the current active segment file size.
+// ActiveSegmentName returns the current active segment filename.
+func (w *Writer) ActiveSegmentName() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.activeName
+}
+
+// ---------- Auto-replay (background) ----------
+
+// StartReplay starts a background goroutine that periodically reads sealed
+// WAL segments and calls fn for each entry. On successful replay of an entire
+// segment, the segment file is deleted. The active segment is never replayed.
+// Safe to call only once; subsequent calls are no-ops.
+func (w *Writer) StartReplay(fn func(Entry) error, interval time.Duration) {
+	w.replayOnce.Do(func() {
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		w.replayStop = make(chan struct{})
+		go w.replayLoop(fn, interval)
+		log.Printf("[INFO] WAL auto-replay started, interval=%v", interval)
+	})
+}
+
+func (w *Writer) replayLoop(fn func(Entry) error, interval time.Duration) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] WAL replay loop panic: %v", r)
+		}
+	}()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.replayStop:
+			return
+		case <-ticker.C:
+			w.replaySealedSegments(fn)
+		}
+	}
+}
+
+// replaySealedSegments reads all non-active segments and replays them.
+// Segments that replay successfully are deleted.
+func (w *Writer) replaySealedSegments(fn func(Entry) error) {
+	active := w.ActiveSegmentName()
+
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		log.Printf("[WARN] wal replay dir read: %v", err)
+		return
+	}
+
+	type segFile struct {
+		path string
+		num  int
+	}
+	var segments []segFile
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "wal-") || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		if e.Name() == active {
+			continue
+		}
+		trimmed := strings.TrimPrefix(e.Name(), "wal-")
+		trimmed = strings.TrimSuffix(trimmed, ".log")
+		n, err := strconv.Atoi(trimmed)
+		if err != nil {
+			continue
+		}
+		segments = append(segments, segFile{path: filepath.Join(w.dir, e.Name()), num: n})
+	}
+
+	if len(segments) == 0 {
+		return
+	}
+
+	sort.Slice(segments, func(i, j int) bool {
+		return segments[i].num < segments[j].num
+	})
+
+	for _, seg := range segments {
+		replayed, err := w.replaySegment(seg.path, fn)
+		if err != nil {
+			log.Printf("[ERROR] wal replay segment %s: %v", seg.path, err)
+			break
+		}
+		if replayed > 0 {
+			log.Printf("[INFO] WAL replay segment %s: %d entries replayed, deleting", seg.path, replayed)
+		}
+		if err := os.Remove(seg.path); err != nil {
+			log.Printf("[WARN] wal remove replayed segment %s: %v", seg.path, err)
+		}
+	}
+}
+
+// replaySegment reads a single segment file and calls fn for each entry.
+func (w *Writer) replaySegment(path string, fn func(Entry) error) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1<<20), 10<<20)
+
+	var count int
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var entry Entry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			log.Printf("[WARN] wal replay skip corrupt line in %s: %v", path, err)
+			continue
+		}
+		if err := fn(entry); err != nil {
+			return count, fmt.Errorf("replay entry failed: %w", err)
+		}
+		count++
+	}
+
+	if err := scanner.Err(); err != nil {
+		return count, fmt.Errorf("wal scan: %w", err)
+	}
+	return count, nil
+}
+
 func (w *Writer) ActiveSegmentSize() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

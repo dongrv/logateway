@@ -23,6 +23,8 @@ import (
 	"github.com/dongrv/logateway/internal/sink"
 	"github.com/dongrv/logateway/internal/wal"
 
+	_ "net/http/pprof"
+
 	"github.com/gin-gonic/gin"
 	"github.com/panjf2000/ants/v2"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -75,6 +77,27 @@ func New(cfgPath string) (*Gateway, error) {
 	}
 
 	replayWAL(cfg, disp)
+
+	// Start background WAL auto-replay so sealed segments get replayed
+	// without requiring a restart.
+	if walWriter != nil {
+		walWriter.StartReplay(func(entry wal.Entry) error {
+			msg := message.AcquireMessage()
+			msg.RequestID = entry.RequestID
+			msg.TraceID = entry.TraceID
+			msg.Project = entry.Project
+			msg.Router = entry.Router
+			msg.Data = entry.Data
+			msg.Timestamp = entry.Timestamp
+			msg.Env = entry.Env
+			if err := disp.Dispatch(msg); err != nil {
+				log.Printf("[ERROR] wal auto-replay dispatch failed: %v, request_id=%s", err, msg.RequestID)
+				message.ReleaseMessage(msg)
+				return err
+			}
+			return nil
+		}, 5*time.Second)
+	}
 
 	pool, err := ants.NewPool(cfg.Server.AntsPoolSize, ants.WithPreAlloc(false))
 	if err != nil {
@@ -217,6 +240,16 @@ func registerHealthEndpoints(r *gin.Engine, cfg *config.Manager, disp *project.D
 	}
 	r.GET(metricsPath, gin.WrapH(promhttp.Handler()))
 
+	// pprof debugging endpoints (opt-in for production troubleshooting)
+	pprofCfg := cfg.Get().Pprof
+	if pprofCfg.Enabled {
+		pprofPath := pprofCfg.Path
+		if pprofPath == "" {
+			pprofPath = "/debug/pprof"
+		}
+		r.Any(pprofPath+"/*action", gin.WrapH(http.DefaultServeMux))
+	}
+
 	r.POST("/admin/config/reload", func(c *gin.Context) {
 		if err := cfg.Reload(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -349,6 +382,7 @@ func replayWAL(cfg *config.Config, disp *project.Dispatcher) {
 		msg.Router = entry.Router
 		msg.Data = entry.Data
 		msg.Timestamp = entry.Timestamp
+		msg.Env = entry.Env
 		if err := disp.Dispatch(msg); err != nil {
 			log.Printf("[ERROR] wal replay dispatch failed: %v, request_id=%s", err, msg.RequestID)
 			message.ReleaseMessage(msg)

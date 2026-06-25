@@ -97,3 +97,7 @@ log:
 metrics:
   enabled: true
   path: "/metrics"
+
+pprof:
+  enabled: true
+  path: "/debug/pprof"

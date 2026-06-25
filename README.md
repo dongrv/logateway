@@ -274,6 +274,7 @@ metrics:
 | GET | `/metrics` | Prometheus 指标 |
 | POST | `/admin/config/reload` | 触发热重载 |
 | GET | `/admin/pools` | Channel 使用率 |
+| GET | `/debug/pprof/` | Go pprof 性能分析（需 `pprof.enabled: true`） |
 
 ---
 
@@ -347,7 +348,8 @@ reg.Register("my-sink", MySinkFactory)
 |------|------|------|
 | Channel 缓冲 | 16384 缓冲 + 16 workers | 瞬时尖峰 |
 | WAL 磁盘兜底 | `backpressure=fallback`，写 `data/wal/` | Channel 溢出 |
-| 启动重放 | `replayWAL` 读取段文件重新投递 | 进程崩溃恢复 |
+| WAL 自动重放 | 后台每 5s 扫描已封存 segment，重新投递后删除 | 无需重启即可回放堆积消息 |
+| 启动重放 | `replayWAL` 读取剩余段文件投递 | 进程崩溃恢复 |
 
 ### 反压策略
 
@@ -355,7 +357,7 @@ reg.Register("my-sink", MySinkFactory)
 |------|-------------|---------|
 | `drop` | 丢弃 | ✗ |
 | `block` | 阻塞 100ms | ✗ (超时后丢弃) |
-| `fallback` | 写磁盘 WAL | ✓ (重启重放) |
+| `fallback` | 写磁盘 WAL | ✓ (自动重放，无需重启) |
 
 ### 优雅关闭
 
@@ -364,6 +366,18 @@ reg.Register("my-sink", MySinkFactory)
 ### 配置热重载限制
 
 `/admin/config/reload` 可热更新鉴权参数、限流阈值。**项目增删、sink 连接变更**需要滚动重启（会先排空 channel 再停服）。
+
+### 熔断自动恢复
+
+下游 Redis/Kafka 宕机后，Worker 连续投递失败 10 次触发**熔断打开**，后续消息直接写入 WAL 磁盘兜底。熔断打开后，后台每 **15 秒** 对下游执行 `HealthCheck`（Redis PING / Kafka TCP）探测；一旦下游恢复，**自动关闭熔断**，恢复正常投递。配合 WAL 自动重放，堆积消息会在下游恢复后陆续回放至目标队列。
+
+```
+下游宕机 → 熔断打开 → 消息写 WAL
+                ↓ 15s 探测
+下游恢复 → 自动关闭熔断 → 正常投递恢复
+                ↓ 5s WAL 重放
+            磁盘 segment → Redis/Kafka
+```
 
 ---
 
@@ -454,6 +468,29 @@ curl http://localhost:8080/admin/pools                   # channel 使用率
 curl http://localhost:8080/metrics | grep gateway_        # 指标
 kill -TERM $(pidof gateway)                               # 优雅关闭
 ```
+
+### 性能分析（pprof）
+
+配置 `pprof.enabled: true` 后，可通过 Go 标准 pprof 工具进行在线诊断：
+
+```bash
+# 浏览器交互式查看
+go tool pprof -http=:6060 http://localhost:8080/debug/pprof/heap
+
+# CPU 采样 30s
+go tool pprof http://localhost:8080/debug/pprof/profile?seconds=30
+
+# 堆内存分析
+go tool pprof http://localhost:8080/debug/pprof/heap
+
+# goroutine 泄漏排查
+go tool pprof http://localhost:8080/debug/pprof/goroutine
+
+# 直接浏览器访问（命令行列出的信息）
+curl http://localhost:8080/debug/pprof/
+```
+
+pprof 仅在主动采样时收集数据，无持续性能开销，生产环境建议保持开启。
 
 ---
 

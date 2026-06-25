@@ -35,13 +35,16 @@ type WorkerPool struct {
 	failCount   int
 	maxFails    int
 
-	backpressure  Backpressure
-	walWriter     *wal.Writer
-	submitTimeout time.Duration
-	walFallbacks  atomic.Int64
+	backpressure     Backpressure
+	walWriter        *wal.Writer
+	submitTimeout    time.Duration
+	walFallbacks     atomic.Int64
+	recoveryInterval time.Duration
 
 	metricsStop  chan struct{}
+	recoveryStop chan struct{}
 	shutdownOnce sync.Once
+	recoveryOnce sync.Once
 }
 
 type WorkerPoolConfig struct {
@@ -69,16 +72,17 @@ func NewWorkerPool(cfg WorkerPoolConfig) *WorkerPool {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	wp := &WorkerPool{
-		sink:          cfg.Sink,
-		workers:       cfg.Workers,
-		ch:            make(chan *message.Message, cfg.ChannelSize),
-		ctx:           ctx,
-		cancel:        cancel,
-		maxFails:      cfg.MaxFails,
-		backpressure:  cfg.Backpressure,
-		walWriter:     cfg.WALWriter,
-		submitTimeout: cfg.SubmitTimeout,
-		metricsStop:   make(chan struct{}),
+		sink:             cfg.Sink,
+		workers:          cfg.Workers,
+		ch:               make(chan *message.Message, cfg.ChannelSize),
+		ctx:              ctx,
+		cancel:           cancel,
+		maxFails:         cfg.MaxFails,
+		backpressure:     cfg.Backpressure,
+		walWriter:        cfg.WALWriter,
+		submitTimeout:    cfg.SubmitTimeout,
+		recoveryInterval: 15 * time.Second,
+		metricsStop:      make(chan struct{}),
 	}
 	wp.start()
 	go wp.reportMetrics()
@@ -207,6 +211,7 @@ func (wp *WorkerPool) recordFailure() {
 		wp.circuitOpen = true
 		metrics.SetCircuitState(wp.sink.Name(), true)
 		log.Printf("[ERROR] circuit breaker opened for sink %s", wp.sink.Name())
+		wp.startRecovery()
 	}
 	wp.mu.Unlock()
 }
@@ -289,6 +294,10 @@ func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 		close(wp.metricsStop)
 		// 3. Close channel — workers' for-range exits after draining
 		close(wp.ch)
+		// 4. Stop recovery if running
+		if wp.recoveryStop != nil {
+			close(wp.recoveryStop)
+		}
 
 		done := make(chan struct{})
 		go func() {
@@ -304,4 +313,46 @@ func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 		}
 	})
 	return err
+}
+
+// startRecovery launches a background health probe that periodically checks
+// sink connectivity. When the sink becomes healthy again, the circuit breaker
+// is closed automatically.
+func (wp *WorkerPool) startRecovery() {
+	wp.recoveryOnce.Do(func() {
+		wp.recoveryStop = make(chan struct{})
+		go wp.recoveryLoop()
+		log.Printf("[INFO] circuit recovery probe started for sink %s", wp.sink.Name())
+	})
+}
+
+func (wp *WorkerPool) recoveryLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] circuit recovery probe panic for sink %s: %v", wp.sink.Name(), r)
+		}
+		// Allow restarting recovery if circuit opens again
+		wp.recoveryOnce = sync.Once{}
+	}()
+
+	ticker := time.NewTicker(wp.recoveryInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-wp.recoveryStop:
+			return
+		case <-ticker.C:
+			if !wp.CircuitOpen() {
+				return
+			}
+			if err := wp.sink.HealthCheck(); err != nil {
+				log.Printf("[WARN] circuit recovery probe failed for sink %s: %v", wp.sink.Name(), err)
+				continue
+			}
+			wp.resetFailures()
+			log.Printf("[INFO] circuit breaker auto-recovered for sink %s", wp.sink.Name())
+			return
+		}
+	}
 }

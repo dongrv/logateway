@@ -24,6 +24,7 @@ type Config struct {
 	Log           LogConfig                     `yaml:"log"`
 	Metrics       MetricsConfig                 `yaml:"metrics"`
 	WAL           WALConfig                     `yaml:"wal"`
+	Pprof         PprofConfig                   `yaml:"pprof"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -142,6 +143,12 @@ type MetricsConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
 	Port    int    `yaml:"port"`
+}
+
+// PprofConfig controls Go pprof debugging endpoints.
+type PprofConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`
 }
 
 // WALConfig holds Write-Ahead Log settings for disk fallback.
