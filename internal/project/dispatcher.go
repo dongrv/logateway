@@ -172,14 +172,40 @@ func (d *Dispatcher) SinkInfos() []SinkInfo {
 }
 
 // Dispatch routes a message to all configured sinks for the project.
-// For multi-sink projects, copies the message for each sink after the first
-// to avoid shared ownership. Worker pools are responsible for releasing
-// the message after processing.
+// Uses Submit (may fallback to WAL). Worker pools release the message.
 func (d *Dispatcher) Dispatch(msg *message.Message) error {
+	return d.dispatchImpl(msg, false)
+}
+
+// DispatchStrict is like Dispatch but uses SubmitStrict — it returns an
+// error if any worker pool channel is full, without falling back to WAL.
+// Used by WAL replay to detect backpressure and preserve segment for retry.
+func (d *Dispatcher) DispatchStrict(msg *message.Message) error {
+	return d.dispatchImpl(msg, true)
+}
+
+// dispatchImpl is the single dispatch implementation. When strict is true,
+// SubmitStrict is used; otherwise Submit (with fallback/drop semantics).
+// On error, the message is always released; callers must not release again.
+func (d *Dispatcher) dispatchImpl(msg *message.Message, strict bool) error {
+	if msg == nil {
+		return fmt.Errorf("nil message")
+	}
+	if msg.Project == "" {
+		message.ReleaseMessage(msg)
+		return fmt.Errorf("empty project")
+	}
+
 	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.pools == nil {
+		message.ReleaseMessage(msg)
+		return fmt.Errorf("dispatcher pools not initialized")
+	}
 	pools, ok := d.pools[msg.Project]
-	d.mu.RUnlock()
 	if !ok {
+		message.ReleaseMessage(msg)
 		return fmt.Errorf("no sinks configured for project %s", msg.Project)
 	}
 
@@ -189,19 +215,28 @@ func (d *Dispatcher) Dispatch(msg *message.Message) error {
 		var err error
 		msg, err = chain.Process(msg)
 		if err != nil {
-			return fmt.Errorf("pipeline processing: %w", err)
+			message.ReleaseMessage(msg)
+			return fmt.Errorf("pipeline %s: %w", projCfg.Name, err)
 		}
 	}
 
 	for i, pool := range pools {
-		var m *message.Message
-		if i == 0 {
-			m = msg // first pool owns the original message
-		} else {
-			m = copyMessage(msg) // subsequent pools get their own copy
+		m := msg
+		if i > 0 {
+			m = copyMessage(msg)
 		}
-		if err := pool.Submit(m); err != nil {
-			message.ReleaseMessage(m)
+		var err error
+		if strict {
+			err = pool.SubmitStrict(m)
+		} else {
+			err = pool.Submit(m)
+		}
+		if err != nil {
+			// Submit/SubmitStrict already released the message on error.
+			// Release remaining copies (i>0) and the original (i==0).
+			if i == 0 {
+				message.ReleaseMessage(msg)
+			}
 			return fmt.Errorf("submit to sink pool: %w", err)
 		}
 	}

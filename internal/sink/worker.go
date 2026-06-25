@@ -281,6 +281,27 @@ func (wp *WorkerPool) WALFallbackCount() int64 {
 	return wp.walFallbacks.Load()
 }
 
+// SubmitStrict enqueues a message or returns an error — it never falls back
+// to WAL or drops. Used by WAL replay to detect channel pressure and abort
+// early, preserving the segment for the next cycle.
+// On error, the message is released (same ownership semantics as Submit).
+func (wp *WorkerPool) SubmitStrict(msg *message.Message) error {
+	wp.mu.RLock()
+	closed := wp.closed
+	wp.mu.RUnlock()
+	if closed {
+		message.ReleaseMessage(msg)
+		return fmt.Errorf("worker pool closed")
+	}
+	select {
+	case wp.ch <- msg:
+		return nil
+	default:
+		message.ReleaseMessage(msg)
+		return fmt.Errorf("worker pool channel full")
+	}
+}
+
 func (wp *WorkerPool) Shutdown(timeout time.Duration) error {
 	var err error
 	wp.shutdownOnce.Do(func() {

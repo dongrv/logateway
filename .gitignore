@@ -28,7 +28,11 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
-data/wal/wal-000001.log
-data/wal/wal-000002.log
+.idea/
+.vscode/
+*.log
+logs/
+
+# agent
+.codex
+.claude

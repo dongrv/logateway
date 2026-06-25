@@ -91,13 +91,9 @@ log:
   file:
     enabled: true
     dir: "logs"
-    levels: ["error", "warn"]
+    levels: ["info", "error", "warn"]
     max_age: 7
 
 metrics:
   enabled: true
   path: "/metrics"
-
-pprof:
-  enabled: true
-  path: "/debug/pprof"

@@ -5,6 +5,7 @@ package wal
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -412,7 +413,7 @@ func (w *Writer) replayLoop(fn func(Entry) error, interval time.Duration) {
 // replaySealedSegments reads all non-active segments and replays them.
 // Segments that replay successfully are deleted.
 func (w *Writer) replaySealedSegments(fn func(Entry) error) {
-	active := w.ActiveSegmentName()
+	active := strings.ToLower(w.ActiveSegmentName())
 
 	entries, err := os.ReadDir(w.dir)
 	if err != nil {
@@ -429,7 +430,8 @@ func (w *Writer) replaySealedSegments(fn func(Entry) error) {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), "wal-") || !strings.HasSuffix(e.Name(), ".log") {
 			continue
 		}
-		if e.Name() == active {
+		// Skip the active segment (case-insensitive, safe for Windows).
+		if strings.ToLower(e.Name()) == active {
 			continue
 		}
 		trimmed := strings.TrimPrefix(e.Name(), "wal-")
@@ -458,26 +460,41 @@ func (w *Writer) replaySealedSegments(fn func(Entry) error) {
 		if replayed > 0 {
 			log.Printf("[INFO] WAL replay segment %s: %d entries replayed, deleting", seg.path, replayed)
 		}
-		if err := os.Remove(seg.path); err != nil {
-			log.Printf("[WARN] wal remove replayed segment %s: %v", seg.path, err)
+		// Delete the replayed segment. On Windows, file handles may be released
+		// asynchronously by the kernel, so we retry with increasing delays.
+		w.removeSegmentFile(seg.path)
+	}
+}
+
+// removeSegmentFile deletes a WAL segment file, retrying with backoff on
+// Windows where the kernel may defer handle release.
+func (w *Writer) removeSegmentFile(path string) {
+	delays := []time.Duration{0, 100 * time.Millisecond, 500 * time.Millisecond}
+	for i, d := range delays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		if err := os.Remove(path); err == nil {
+			return
+		} else if i == len(delays)-1 {
+			log.Printf("[WARN] wal remove segment %s: %v (will retry next cycle)", path, err)
 		}
 	}
 }
 
 // replaySegment reads a single segment file and calls fn for each entry.
+// The entire file is read into memory and closed before processing begins,
+// so the caller can safely remove the file immediately afterward (including
+// on Windows where open handles block deletion).
 func (w *Writer) replaySegment(path string, fn func(Entry) error) (int, error) {
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1<<20), 10<<20)
 
 	var count int
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	lines := bytes.Split(raw, []byte{0x0a})
+	for _, line := range lines {
 		if len(line) == 0 {
 			continue
 		}
@@ -490,10 +507,7 @@ func (w *Writer) replaySegment(path string, fn func(Entry) error) (int, error) {
 			return count, fmt.Errorf("replay entry failed: %w", err)
 		}
 		count++
-	}
-
-	if err := scanner.Err(); err != nil {
-		return count, fmt.Errorf("wal scan: %w", err)
+		time.Sleep(500 * time.Microsecond)
 	}
 	return count, nil
 }

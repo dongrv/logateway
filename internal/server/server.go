@@ -46,7 +46,7 @@ func New(cfgPath string) (*Gateway, error) {
 		return nil, fmt.Errorf("config: %w", err)
 	}
 	cfg := cfgMgr.Get()
-	logging.Setup(cfg.Log.File.Dir)
+	logging.Setup(cfg.Log.File.Dir, cfg.Log.Console.Enabled, cfg.Log.File.Levels)
 
 	if err := cfgMgr.Watch(); err != nil {
 		log.Printf("[WARN] config file watcher failed: %v (hot-reload disabled)", err)
@@ -90,9 +90,9 @@ func New(cfgPath string) (*Gateway, error) {
 			msg.Data = entry.Data
 			msg.Timestamp = entry.Timestamp
 			msg.Env = entry.Env
-			if err := disp.Dispatch(msg); err != nil {
-				log.Printf("[ERROR] wal auto-replay dispatch failed: %v, request_id=%s", err, msg.RequestID)
-				message.ReleaseMessage(msg)
+			// DispatchStrict: channel-full returns error → segment preserved for retry
+			if err := disp.DispatchStrict(msg); err != nil {
+				log.Printf("[WARN] wal auto-replay dispatch failed (will retry): %v, request_id=%s", err, msg.RequestID)
 				return err
 			}
 			return nil
@@ -327,7 +327,6 @@ func UploadHandler(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.
 			if err := disp.Dispatch(msg); err != nil {
 				observability.LogJSON("error", "dispatch failed",
 					msg.RequestID, msg.TraceID, msg.Project, err.Error())
-				message.ReleaseMessage(msg)
 			}
 		}); err != nil {
 			message.ReleaseMessage(msg)
@@ -372,9 +371,21 @@ func initWAL(cfg *config.Config, bp sink.Backpressure) (*wal.Writer, error) {
 }
 
 func replayWAL(cfg *config.Config, disp *project.Dispatcher) {
+	if cfg.WAL.Dir == "" || disp == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] wal replay panic: %v", r)
+		}
+	}()
 	entryCh, errCh := wal.ReadAll(cfg.WAL.Dir)
 	var replayed int
 	for entry := range entryCh {
+		if entry.Project == "" {
+			log.Printf("[WARN] wal replay skip entry with empty project")
+			continue
+		}
 		msg := message.AcquireMessage()
 		msg.RequestID = entry.RequestID
 		msg.TraceID = entry.TraceID
@@ -383,9 +394,8 @@ func replayWAL(cfg *config.Config, disp *project.Dispatcher) {
 		msg.Data = entry.Data
 		msg.Timestamp = entry.Timestamp
 		msg.Env = entry.Env
-		if err := disp.Dispatch(msg); err != nil {
+		if err := disp.DispatchStrict(msg); err != nil {
 			log.Printf("[ERROR] wal replay dispatch failed: %v, request_id=%s", err, msg.RequestID)
-			message.ReleaseMessage(msg)
 		}
 		replayed++
 	}

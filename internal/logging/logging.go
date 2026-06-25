@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -15,26 +16,31 @@ var (
 	consoleOut  io.Writer = os.Stdout
 )
 
-// Setup configures log output. Console goes to stdout, error/warn to daily files.
-func Setup(dir string) {
+// Setup configures log output. levels specifies which log levels get their
+// own daily file (e.g. ["error", "warn", "info"]). If empty, defaults to
+// ["error", "warn"]. If consoleEnabled is false, stdout is suppressed.
+func Setup(dir string, consoleEnabled bool, levels []string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	writers := []io.Writer{consoleOut}
+	if len(levels) == 0 {
+		levels = []string{"error", "warn"}
+	}
 
-	// Error file writer (lazy-create on first write)
-	ew := newDailyWriter(dir, "error")
-	fileWriters = append(fileWriters, ew)
-	writers = append(writers, &levelFilter{inner: ew, level: "error"})
+	var writers []io.Writer
+	if consoleEnabled {
+		writers = append(writers, consoleOut)
+	}
 
-	// Warn file writer
-	ww := newDailyWriter(dir, "warn")
-	fileWriters = append(fileWriters, ww)
-	writers = append(writers, &levelFilter{inner: ww, level: "warn"})
+	for _, lvl := range levels {
+		dw := newDailyWriter(dir, lvl)
+		fileWriters = append(fileWriters, dw)
+		writers = append(writers, &levelFilter{inner: dw, level: lvl})
+	}
 
 	log.SetOutput(io.MultiWriter(writers...))
 	log.SetFlags(log.LstdFlags)
-	log.Println("[INFO] logging initialized: console + file (error/warn)")
+	log.Printf("[INFO] logging initialized: console=%v file_levels=%v", consoleEnabled, levels)
 }
 
 // Close flushes and closes all file writers.
@@ -62,8 +68,9 @@ func (f *levelFilter) Write(p []byte) (int, error) {
 
 func containsLevel(p []byte, level string) bool {
 	prefix := "[" + level + "]"
-	for i := 0; i < len(p); i++ {
-		if i+len(prefix) <= len(p) && string(p[i:i+len(prefix)]) == prefix {
+	prefixLen := len(prefix)
+	for i := 0; i <= len(p)-prefixLen; i++ {
+		if strings.EqualFold(string(p[i:i+prefixLen]), prefix) {
 			return true
 		}
 	}
