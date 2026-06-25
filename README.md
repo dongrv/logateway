@@ -32,6 +32,7 @@ logateway 是一个高可用、高并发、可观测、可扩展的集中式 HTT
   │
   ▼
 Gin HTTP Server
+  ├── Body 大小限制（BodyCacheMiddleware）
   ├── 全局限流
   ├── HMAC-SHA256 鉴权 + Nonce 防重放
   ├── 项目解析 → 三层配置合并
@@ -40,8 +41,9 @@ Gin HTTP Server
          ▼
   Worker Pool (可配置 workers + channel_size)
     ├── Retry ×3（指数退避）
-    ├── Circuit Breaker（连续失败自动熔断）
+    ├── Circuit Breaker（连续失败自动熔断 → 15s 探测自动恢复）
     ├── WAL 磁盘兜底（backpressure=fallback）
+    ├── WAL 自动重放（启动立即执行 + 每 5s，自适应限速）
     └── Sink
           ├── Redis (List / Stream)
           ├── Kafka
@@ -294,6 +296,30 @@ Signature = Hex(HMAC-SHA256(Secret, Body + Timestamp + Nonce))
 
 客户端示例见 `examples/` 目录或运行 `go test -v ./internal/server/ -run TestUpload`。
 
+### 可运行客户端示例
+
+根目录提供了一个完整 HMAC 签名客户端，可直接发送测试消息：
+
+```bash
+go run ./examples
+```
+
+常用参数：
+
+```bash
+go run ./examples \
+  -url http://127.0.0.1:8080/api/v1/log/upload \
+  -app-key test-app-key \
+  -secret test-secret \
+  -project actilogs \
+  -router 'CH=Behavior' \
+  -data '{"UID":123,"action":"click"}' \
+  -count 10 \
+  -concurrency 2
+```
+
+也可使用环境变量：`LOGATEWAY_URL`、`LOGATEWAY_APP_KEY`、`LOGATEWAY_SECRET`、`LOGATEWAY_PROJECT`、`LOGATEWAY_ROUTER`。
+
 ---
 
 ## 投递后端
@@ -347,9 +373,8 @@ reg.Register("my-sink", MySinkFactory)
 | 层级 | 机制 | 场景 |
 |------|------|------|
 | Channel 缓冲 | 16384 缓冲 + 16 workers | 瞬时尖峰 |
-| WAL 磁盘兜底 | `backpressure=fallback`，写 `data/wal/` | Channel 溢出 |
-| WAL 自动重放 | 后台每 5s 扫描已封存 segment，重新投递后删除 | 无需重启即可回放堆积消息 |
-| 启动重放 | `replayWAL` 读取剩余段文件投递 | 进程崩溃恢复 |
+| WAL 磁盘兜底 | `backpressure=fallback`，写 `data/wal/` | Channel 溢出 / 下游宕机 |
+| WAL 自动重放 | 启动立即执行 + 每 5s 周期扫描，自适应限速（channel > 50% 降速，> 80% 暂停），回调确认后才删文件 | 无需重启即可回放堆积消息，不阻塞 HTTP 启动 |
 
 ### 反压策略
 
@@ -563,7 +588,7 @@ go vet ./...
 
 ### 消息会丢吗？
 
-默认配置 `backpressure: fallback` + `wal.enabled: true` 确保不丢失：channel 满 → 写磁盘 → 重启重放。优雅关闭排空 channel。
+默认配置 `backpressure: fallback` + `wal.enabled: true` 确保不丢失：channel 满或下游宕机 → 写 WAL 磁盘 → 后台自动重放（每 5s，自适应限速，确认投递成功后才删文件）。Worker panic / 回调异常均有 recover 兜底，优雅关闭排空 channel。
 
 ### 怎么新增项目？
 
@@ -600,6 +625,11 @@ YAML 添加 project → `POST /admin/config/reload` 热重载（限流/鉴权生
 - [x] Pipeline 处理器（field_filter / field_add / field_redact）
 - [x] 磁盘 WAL 兜底 + 重启重放
 - [x] 命名 Sink 实例 + 三层配置合并
+- [x] WAL 自适应回放限速（ReplayBackoff / CanAcceptReplay）
+- [x] Pipeline 重放跳过（skipPipeline，避免数据重复处理）
+- [x] Worker 级 + 回调级 panic recover
+- [x] BodyCacheMiddleware（Body 大小提前校验）
+- [x] pprof 性能诊断端点
 - [ ] 压力测试报告
 
 ---
