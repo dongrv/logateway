@@ -31,3 +31,4 @@ go.work.sum
 # .idea/
 # .vscode/
 data/wal/wal-000001.log
+data/wal/wal-000002.log
