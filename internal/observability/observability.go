@@ -2,7 +2,9 @@
 package observability
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -26,6 +28,8 @@ type HealthChecker struct {
 	statuses  map[string]bool
 	probes    map[string]Probe
 	lastCheck time.Time
+	stopOnce  sync.Once
+	stopCh    chan struct{}
 }
 
 // NewHealthChecker creates a new health checker.
@@ -33,6 +37,7 @@ func NewHealthChecker() *HealthChecker {
 	return &HealthChecker{
 		statuses: make(map[string]bool),
 		probes:   make(map[string]Probe),
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -43,8 +48,12 @@ func (h *HealthChecker) Register(name string, probe Probe) {
 	h.probes[name] = probe
 }
 
-// Run starts periodic health checking in a background goroutine.
-func (h *HealthChecker) Run(interval time.Duration) {
+// Run starts periodic health checking in a background goroutine. It returns a
+// stop function that is safe to call multiple times.
+func (h *HealthChecker) Run(interval time.Duration) func() {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
 	ticker := time.NewTicker(interval)
 	go func() {
 		defer ticker.Stop()
@@ -53,24 +62,70 @@ func (h *HealthChecker) Run(interval time.Duration) {
 				log.Printf("[ERROR] health checker panic: %v", r)
 			}
 		}()
-		for range ticker.C {
-			h.checkAll()
+		h.checkAll()
+		for {
+			select {
+			case <-h.stopCh:
+				return
+			case <-ticker.C:
+				h.checkAll()
+			}
 		}
 	}()
+	return func() {
+		h.stopOnce.Do(func() {
+			close(h.stopCh)
+		})
+	}
 }
 
 func (h *HealthChecker) checkAll() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	probes := make(map[string]Probe, len(h.probes))
 	for name, probe := range h.probes {
-		if err := probe(); err != nil {
-			h.statuses[name] = false
+		probes[name] = probe
+	}
+	h.mu.RUnlock()
+
+	statuses := make(map[string]bool, len(probes))
+	for name, probe := range probes {
+		if err := runProbe(probe, 3*time.Second); err != nil {
+			statuses[name] = false
 			log.Printf("[WARN] health check %s failed: %v", name, err)
 		} else {
-			h.statuses[name] = true
+			statuses[name] = true
 		}
 	}
+
+	h.mu.Lock()
+	h.statuses = statuses
 	h.lastCheck = time.Now()
+	h.mu.Unlock()
+}
+
+func runProbe(probe Probe, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				errCh <- fmt.Errorf("panic: %v", r)
+			}
+		}()
+		errCh <- probe()
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Status returns the cached health status of all components.

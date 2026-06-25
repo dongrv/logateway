@@ -6,6 +6,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -31,7 +33,6 @@ type Middleware struct {
 	keyStore   AppKeyStore
 	nonceMu    sync.RWMutex
 	nonceCache map[string]time.Time
-	maxNonces  int
 }
 
 // NewMiddleware creates a new auth middleware.
@@ -41,7 +42,6 @@ func NewMiddleware(cfg *config.Manager, store AppKeyStore) (*Middleware, error) 
 		cfg:        cfg,
 		keyStore:   store,
 		nonceCache: make(map[string]time.Time, authCfg.NonceCacheSize),
-		maxNonces:  authCfg.NonceCacheSize,
 	}, nil
 }
 
@@ -59,19 +59,12 @@ func (m *Middleware) Handler() gin.HandlerFunc {
 		nonce := c.GetHeader("X-Nonce")
 		signature := c.GetHeader("X-Signature")
 
-		// Read body for signature verification
-		bodyBytes, err := io.ReadAll(c.Request.Body)
-		c.Request.Body.Close()
-		if err != nil {
-			writeAuthError(c, http.StatusBadRequest, "failed to read request body")
+		bodyBytes, ok := rawBodyFromContext(c)
+		if !ok {
+			writeAuthError(c, http.StatusBadRequest, "request body not available")
 			c.Abort()
 			return
 		}
-		bodyStr := string(bodyBytes)
-		// Re-set the body so downstream handlers can read it
-		c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		// Use Set to store raw body for later use
-		c.Set("raw_body", bodyBytes)
 
 		// 1. Check AppKey exists
 		if appKey == "" {
@@ -101,28 +94,37 @@ func (m *Middleware) Handler() gin.HandlerFunc {
 			return
 		}
 
-		// 3. Check nonce for replay protection
+		// 3. Validate nonce presence. It is consumed atomically after the
+		// signature succeeds, so concurrent replays cannot pass together.
 		if nonce == "" {
 			writeAuthError(c, http.StatusUnauthorized, "missing nonce")
 			c.Abort()
 			return
 		}
-		if m.isNonceReplayed(nonce) {
-			writeAuthError(c, http.StatusUnauthorized, "nonce already used")
-			c.Abort()
-			return
-		}
 
 		// 4. Verify signature
-		expectedSig := computeHMAC(secret, bodyStr, timestampStr, nonce)
-		if !hmac.Equal([]byte(expectedSig), []byte(signature)) {
+		if !verifyHMAC(secret, bodyBytes, timestampStr, nonce, signature) {
 			writeAuthError(c, http.StatusUnauthorized, "signature mismatch")
 			c.Abort()
 			return
 		}
 
-		// Cache the nonce
-		m.cacheNonce(nonce)
+		var peek struct {
+			Project string `json:"project"`
+		}
+		if err := json.Unmarshal(bodyBytes, &peek); err == nil && peek.Project != "" {
+			if err := authorizeProject(m.keyStore, appKey, peek.Project); err != nil {
+				writeAuthError(c, http.StatusForbidden, "app key is not authorized for project")
+				c.Abort()
+				return
+			}
+		}
+
+		if m.consumeNonce(appKey, nonce, authCfg.NonceTTLSeconds, authCfg.NonceCacheSize) {
+			writeAuthError(c, http.StatusUnauthorized, "nonce already used")
+			c.Abort()
+			return
+		}
 
 		// Store app key for downstream use
 		c.Set("app_key", appKey)
@@ -130,32 +132,106 @@ func (m *Middleware) Handler() gin.HandlerFunc {
 	}
 }
 
-func (m *Middleware) isNonceReplayed(nonce string) bool {
-	m.nonceMu.RLock()
-	_, ok := m.nonceCache[nonce]
-	m.nonceMu.RUnlock()
-	return ok
-}
+func (m *Middleware) consumeNonce(appKey, nonce string, ttlSeconds, maxNonces int) bool {
+	if ttlSeconds <= 0 {
+		ttlSeconds = 300
+	}
+	if maxNonces <= 0 {
+		maxNonces = 100000
+	}
 
-func (m *Middleware) cacheNonce(nonce string) {
+	key := appKey + "\x00" + nonce
+	now := time.Now()
+	expireBefore := now.Add(-time.Duration(ttlSeconds) * time.Second)
+
 	m.nonceMu.Lock()
 	defer m.nonceMu.Unlock()
 
-	// Evict oldest entries if at capacity
-	if len(m.nonceCache) >= m.maxNonces {
-		for k := range m.nonceCache {
+	for k, seenAt := range m.nonceCache {
+		if seenAt.Before(expireBefore) {
 			delete(m.nonceCache, k)
-			break // just evict one to make room
 		}
 	}
-	m.nonceCache[nonce] = time.Now()
+
+	if _, exists := m.nonceCache[key]; exists {
+		return true
+	}
+
+	for len(m.nonceCache) >= maxNonces {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, seenAt := range m.nonceCache {
+			if oldestKey == "" || seenAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = seenAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(m.nonceCache, oldestKey)
+	}
+
+	m.nonceCache[key] = now
+	return false
 }
 
 func computeHMAC(secret, body, timestamp, nonce string) string {
-	data := body + timestamp + nonce
+	data := append([]byte(body), timestamp...)
+	data = append(data, nonce...)
+	return hex.EncodeToString(computeHMACBytes(secret, data))
+}
+
+func verifyHMAC(secret string, body []byte, timestamp, nonce, signature string) bool {
+	if signature == "" {
+		return false
+	}
+	got, err := hex.DecodeString(signature)
+	if err != nil {
+		return false
+	}
+	data := make([]byte, 0, len(body)+len(timestamp)+len(nonce))
+	data = append(data, body...)
+	data = append(data, timestamp...)
+	data = append(data, nonce...)
+	expected := computeHMACBytes(secret, data)
+	return hmac.Equal(expected, got)
+}
+
+func computeHMACBytes(secret string, data []byte) []byte {
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(data))
-	return hex.EncodeToString(mac.Sum(nil))
+	mac.Write(data)
+	return mac.Sum(nil)
+}
+
+func rawBodyFromContext(c *gin.Context) ([]byte, bool) {
+	if b, exists := c.Get("raw_body"); exists {
+		raw, ok := b.([]byte)
+		return raw, ok
+	}
+	if c.Request.Body == nil {
+		return nil, false
+	}
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(c.Request.Body); err != nil {
+		return nil, false
+	}
+	raw := buf.Bytes()
+	c.Request.Body.Close()
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	c.Set("raw_body", raw)
+	return raw, true
+}
+
+func authorizeProject(store AppKeyStore, appKey, project string) error {
+	ok, err := store.IsAuthorized(appKey, project)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("app key %q is not authorized for project %q", appKey, project)
+	}
+	return nil
 }
 
 func writeAuthError(c *gin.Context, code int, msg string) {

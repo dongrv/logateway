@@ -5,7 +5,6 @@ package wal
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +20,8 @@ import (
 
 	"github.com/dongrv/logateway/internal/message"
 )
+
+const hardReplayLineCap = 64 << 20
 
 // Config holds WAL configuration.
 type Config struct {
@@ -97,6 +98,11 @@ func NewWriter(cfg Config) (*Writer, error) {
 
 	if err := w.openLatest(); err != nil {
 		return nil, fmt.Errorf("wal open: %w", err)
+	}
+	if w.activeSeg != nil && w.activeSize > 0 {
+		if err := w.rotate(); err != nil {
+			return nil, fmt.Errorf("wal seal previous active segment: %w", err)
+		}
 	}
 
 	if cfg.SyncInterval > 0 {
@@ -290,12 +296,9 @@ func (w *Writer) purgeOldSegments() {
 		return segments[i].num < segments[j].num
 	})
 
-	for _, seg := range segments[:len(segments)-w.cfg.MaxSegments] {
-		path := filepath.Join(w.dir, seg.name)
-		if err := os.Remove(path); err != nil {
-			log.Printf("[WARN] wal purge %s: %v", seg.name, err)
-		}
-	}
+	over := len(segments) - w.cfg.MaxSegments
+	log.Printf("[WARN] wal segment count %d exceeds max_segments=%d by %d; preserving all segments to avoid data loss",
+		len(segments), w.cfg.MaxSegments, over)
 }
 
 func (w *Writer) syncLoop() {
@@ -400,6 +403,8 @@ func (w *Writer) replayLoop(fn func(Entry) error, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	w.replaySealedSegments(fn)
+
 	for {
 		select {
 		case <-w.replayStop:
@@ -482,19 +487,21 @@ func (w *Writer) removeSegmentFile(path string) {
 	}
 }
 
-// replaySegment reads a single segment file and calls fn for each entry.
-// The entire file is read into memory and closed before processing begins,
-// so the caller can safely remove the file immediately afterward (including
-// on Windows where open handles block deletion).
+// replaySegment streams a single segment file and calls fn for each entry.
+// The caller deletes the segment only after this function reports success.
 func (w *Writer) replaySegment(path string, fn func(Entry) error) (int, error) {
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
 	}
+	defer f.Close()
 
 	var count int
-	lines := bytes.Split(raw, []byte{0x0a})
-	for _, line := range lines {
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64<<10), maxReplayLineBytes(w.cfg.MaxSegmentBytes))
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
@@ -503,13 +510,32 @@ func (w *Writer) replaySegment(path string, fn func(Entry) error) (int, error) {
 			log.Printf("[WARN] wal replay skip corrupt line in %s: %v", path, err)
 			continue
 		}
-		if err := fn(entry); err != nil {
+		if err := invokeReplayCallback(fn, entry); err != nil {
 			return count, fmt.Errorf("replay entry failed: %w", err)
 		}
 		count++
 		time.Sleep(500 * time.Microsecond)
 	}
+	if err := scanner.Err(); err != nil {
+		return count, fmt.Errorf("wal scan: %w", err)
+	}
 	return count, nil
+}
+
+func invokeReplayCallback(fn func(Entry) error, entry Entry) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return fn(entry)
+}
+
+func maxReplayLineBytes(maxSegmentBytes int64) int {
+	if maxSegmentBytes > 0 && maxSegmentBytes < hardReplayLineCap {
+		return int(maxSegmentBytes)
+	}
+	return hardReplayLineCap
 }
 
 func (w *Writer) ActiveSegmentSize() int64 {
@@ -521,6 +547,8 @@ func (w *Writer) ActiveSegmentSize() int64 {
 // ---------- Reader (replay) ----------
 
 // ReadAll reads all WAL entries from all segment files, ordered by sequence.
+// It does not delete segments; deletion is only safe after replay callbacks
+// have accepted every entry in a segment.
 func ReadAll(dir string) (<-chan Entry, <-chan error) {
 	entryCh := make(chan Entry, 256)
 	errCh := make(chan error, 1)
@@ -582,7 +610,7 @@ func readSegment(path string, out chan<- Entry) error {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1<<20), 10<<20)
+	scanner.Buffer(make([]byte, 0, 64<<10), hardReplayLineCap)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -599,10 +627,6 @@ func readSegment(path string, out chan<- Entry) error {
 
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("wal scan: %w", err)
-	}
-
-	if err := os.Remove(path); err != nil {
-		log.Printf("[WARN] wal remove replayed segment %s: %v", path, err)
 	}
 
 	return nil

@@ -71,8 +71,10 @@ type SinkRef struct {
 
 // SinkInstanceConfig defines a named, reusable sink instance.
 type SinkInstanceConfig struct {
-	Type   string                 `yaml:"type"`
-	Config map[string]interface{} `yaml:"config"`
+	Type        string                 `yaml:"type"`
+	Workers     int                    `yaml:"workers"`
+	ChannelSize int                    `yaml:"channel_size"`
+	Config      map[string]interface{} `yaml:"config"`
 }
 
 // PipelineRef references a pipeline processor.
@@ -162,12 +164,14 @@ type WALConfig struct {
 
 // Manager manages configuration loading and hot-reloading.
 type Manager struct {
-	current  atomic.Value
-	path     string
-	watcher  *fsnotify.Watcher
-	stopCh   chan struct{}
-	reloadMu sync.Mutex
-	onReload []func(*Config)
+	current   atomic.Value
+	path      string
+	watcher   *fsnotify.Watcher
+	stopCh    chan struct{}
+	closeOnce sync.Once
+	reloadMu  sync.Mutex
+	onReload  []func(*Config)
+	watchMu   sync.Mutex
 }
 
 // NewManager creates a new config manager.
@@ -208,7 +212,14 @@ func (m *Manager) load() error {
 	m.current.Store(&cfg)
 
 	for _, fn := range callbacks {
-		fn(&cfg)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[ERROR] config reload callback panic: %v", r)
+				}
+			}()
+			fn(&cfg)
+		}()
 	}
 	return nil
 }
@@ -220,6 +231,11 @@ func (m *Manager) Reload() error {
 
 // Watch starts watching the config file for changes using fsnotify.
 func (m *Manager) Watch() error {
+	m.watchMu.Lock()
+	defer m.watchMu.Unlock()
+	if m.watcher != nil {
+		return nil
+	}
 	var err error
 	m.watcher, err = fsnotify.NewWatcher()
 	if err != nil {
@@ -291,10 +307,12 @@ func (m *Manager) watchLoop() {
 
 // Close stops the file watcher if active.
 func (m *Manager) Close() {
-	if m.watcher != nil {
-		m.watcher.Close()
-	}
-	close(m.stopCh)
+	m.closeOnce.Do(func() {
+		if m.watcher != nil {
+			m.watcher.Close()
+		}
+		close(m.stopCh)
+	})
 }
 
 // Get returns the current configuration (safe for concurrent use).

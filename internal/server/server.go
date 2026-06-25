@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,7 +28,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/panjf2000/ants/v2"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Gateway struct {
@@ -37,7 +37,11 @@ type Gateway struct {
 	disp      *project.Dispatcher
 	walWriter *wal.Writer
 	pool      *ants.Pool
+	hc        *observability.HealthChecker
 	stopCh    chan struct{}
+	stopHC    func()
+	stopOnce  sync.Once
+	closeOnce sync.Once
 }
 
 func New(cfgPath string) (*Gateway, error) {
@@ -72,27 +76,29 @@ func New(cfgPath string) (*Gateway, error) {
 
 	disp := project.NewDispatcher(cfgMgr, reg, walWriter, bp)
 	if err := disp.Initialize(); err != nil {
+		if walWriter != nil {
+			_ = walWriter.Close()
+		}
 		cfgMgr.Close()
 		return nil, fmt.Errorf("dispatcher: %w", err)
 	}
-
-	replayWAL(cfg, disp)
 
 	// Start background WAL auto-replay so sealed segments get replayed
 	// without requiring a restart.
 	if walWriter != nil {
 		walWriter.StartReplay(func(entry wal.Entry) error {
-			msg := message.AcquireMessage()
-			msg.RequestID = entry.RequestID
-			msg.TraceID = entry.TraceID
-			msg.Project = entry.Project
-			msg.Router = entry.Router
-			msg.Data = entry.Data
-			msg.Timestamp = entry.Timestamp
-			msg.Env = entry.Env
+			if entry.Project == "" {
+				return fmt.Errorf("empty project")
+			}
+			if delay, err := disp.ReplayBackoff(entry.Project); err != nil {
+				return err
+			} else if delay > 0 {
+				time.Sleep(delay)
+			}
+			msg := messageFromWALEntry(entry)
 			// DispatchStrict: channel-full returns error → segment preserved for retry
 			if err := disp.DispatchStrict(msg); err != nil {
-				log.Printf("[WARN] wal auto-replay dispatch failed (will retry): %v, request_id=%s", err, msg.RequestID)
+				log.Printf("[WARN] wal auto-replay dispatch failed (will retry): %v, request_id=%s", err, entry.RequestID)
 				return err
 			}
 			return nil
@@ -101,12 +107,18 @@ func New(cfgPath string) (*Gateway, error) {
 
 	pool, err := ants.NewPool(cfg.Server.AntsPoolSize, ants.WithPreAlloc(false))
 	if err != nil {
+		if walWriter != nil {
+			_ = walWriter.Close()
+		}
+		_ = disp.Shutdown()
 		cfgMgr.Close()
 		return nil, fmt.Errorf("ants pool: %w", err)
 	}
 	metrics.PoolCapacity.Set(float64(pool.Cap()))
 
-	router := buildRouter(cfgMgr, disp, pool)
+	hc := observability.NewHealthChecker()
+	registerSinkProbes(hc, disp)
+	router := buildRouter(cfgMgr, disp, pool, hc)
 
 	return &Gateway{
 		Config:    cfgMgr,
@@ -114,6 +126,7 @@ func New(cfgPath string) (*Gateway, error) {
 		disp:      disp,
 		walWriter: walWriter,
 		pool:      pool,
+		hc:        hc,
 		stopCh:    make(chan struct{}),
 	}, nil
 }
@@ -122,9 +135,13 @@ func (g *Gateway) Run() error {
 	cfg := g.Config.Get()
 	go g.reportMetrics()
 
-	hc := observability.NewHealthChecker()
-	registerSinkProbes(hc, g.disp)
-	hc.Run(5 * time.Second)
+	g.stopHC = g.hc.Run(5 * time.Second)
+	defer func() {
+		if g.stopHC != nil {
+			g.stopHC()
+		}
+		g.stopMetrics()
+	}()
 
 	g.server = &http.Server{
 		Addr:         cfg.Server.ListenAddr,
@@ -134,18 +151,24 @@ func (g *Gateway) Run() error {
 		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
+	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("[INFO] gateway starting on %s (bp=%s wal=%v)",
 			cfg.Server.ListenAddr, cfg.Server.Backpressure, cfg.WAL.Enabled)
 		if err := g.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[FATAL] server error: %v", err)
+			serverErr <- err
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-quit
-	log.Printf("[INFO] received signal %v, shutting down...", sig)
+
+	select {
+	case sig := <-quit:
+		log.Printf("[INFO] received signal %v, shutting down...", sig)
+	case err := <-serverErr:
+		return fmt.Errorf("server listen: %w", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -156,19 +179,35 @@ func (g *Gateway) Run() error {
 	if err := g.disp.Shutdown(); err != nil {
 		log.Printf("[ERROR] dispatcher shutdown error: %v", err)
 	}
-	close(g.stopCh)
+	if g.walWriter != nil {
+		if err := g.walWriter.Close(); err != nil {
+			log.Printf("[ERROR] wal close error: %v", err)
+		}
+	}
 	return nil
 }
 
 func (g *Gateway) Close() {
-	if g.pool != nil {
-		g.pool.Release()
-	}
-	if g.walWriter != nil {
-		g.walWriter.Close()
-	}
-	g.Config.Close()
-	logging.Close()
+	g.closeOnce.Do(func() {
+		if g.stopHC != nil {
+			g.stopHC()
+		}
+		g.stopMetrics()
+		if g.pool != nil {
+			g.pool.Release()
+		}
+		if g.walWriter != nil {
+			g.walWriter.Close()
+		}
+		g.Config.Close()
+		logging.Close()
+	})
+}
+
+func (g *Gateway) stopMetrics() {
+	g.stopOnce.Do(func() {
+		close(g.stopCh)
+	})
 }
 
 func (g *Gateway) reportMetrics() {
@@ -184,7 +223,7 @@ func (g *Gateway) reportMetrics() {
 	}
 }
 
-func buildRouter(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.Pool) *gin.Engine {
+func buildRouter(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.Pool, hc *observability.HealthChecker) *gin.Engine {
 	router := gin.New()
 	rlMgr := ratelimit.NewManager(cfgMgr)
 
@@ -194,14 +233,12 @@ func buildRouter(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.Po
 	router.Use(LoggingMiddleware())
 	router.Use(rlMgr.GlobalMiddleware())
 
-	// HealthChecker is created later in Run(), so we pass cfgMgr/disp only.
-	// The /health endpoint will use the checker from Run()'s goroutine scope.
-	// For now, /health returns a basic status until the checker starts.
-	registerHealthEndpoints(router, cfgMgr, disp)
+	registerHealthEndpoints(router, cfgMgr, disp, hc)
 
 	api := router.Group("/api/v1/log")
 	{
 		api.POST("/upload",
+			BodyCacheMiddleware(cfgMgr),
 			authMiddleware(cfgMgr),
 			ProjectResolutionMiddleware(cfgMgr),
 			rlMgr.ProjectMiddleware(),
@@ -217,30 +254,20 @@ func authMiddleware(cfgMgr *config.Manager) gin.HandlerFunc {
 	}
 	mw, err := auth.NewMiddleware(cfgMgr, keyStore)
 	if err != nil {
-		log.Fatalf("auth middleware: %v", err)
+		return func(c *gin.Context) {
+			log.Printf("[ERROR] auth middleware unavailable: %v", err)
+			c.AbortWithStatusJSON(http.StatusInternalServerError, message.UploadResponse{
+				Code:    http.StatusInternalServerError,
+				Message: "authentication unavailable",
+			})
+		}
 	}
 	return mw.Handler()
 }
 
-func registerHealthEndpoints(r *gin.Engine, cfg *config.Manager, disp *project.Dispatcher) {
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status":    "ok",
-			"timestamp": time.Now().UTC().Format(time.RFC3339),
-		})
-	})
+func registerHealthEndpoints(r *gin.Engine, cfg *config.Manager, disp *project.Dispatcher, hc *observability.HealthChecker) {
+	observability.RegisterHealthEndpoints(r, hc, cfg, disp)
 
-	r.GET("/ready", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"ready": true})
-	})
-
-	metricsPath := cfg.Get().Metrics.Path
-	if metricsPath == "" {
-		metricsPath = "/metrics"
-	}
-	r.GET(metricsPath, gin.WrapH(promhttp.Handler()))
-
-	// pprof debugging endpoints (opt-in for production troubleshooting)
 	pprofCfg := cfg.Get().Pprof
 	if pprofCfg.Enabled {
 		pprofPath := pprofCfg.Path
@@ -249,19 +276,6 @@ func registerHealthEndpoints(r *gin.Engine, cfg *config.Manager, disp *project.D
 		}
 		r.Any(pprofPath+"/*action", gin.WrapH(http.DefaultServeMux))
 	}
-
-	r.POST("/admin/config/reload", func(c *gin.Context) {
-		if err := cfg.Reload(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"message": "config reloaded"})
-	})
-
-	r.GET("/admin/pools", func(c *gin.Context) {
-		statuses := disp.GetPoolStatus()
-		c.JSON(http.StatusOK, statuses)
-	})
 }
 
 func UploadHandler(cfgMgr *config.Manager, disp *project.Dispatcher, pool *ants.Pool) gin.HandlerFunc {
@@ -370,41 +384,16 @@ func initWAL(cfg *config.Config, bp sink.Backpressure) (*wal.Writer, error) {
 	return w, nil
 }
 
-func replayWAL(cfg *config.Config, disp *project.Dispatcher) {
-	if cfg.WAL.Dir == "" || disp == nil {
-		return
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[ERROR] wal replay panic: %v", r)
-		}
-	}()
-	entryCh, errCh := wal.ReadAll(cfg.WAL.Dir)
-	var replayed int
-	for entry := range entryCh {
-		if entry.Project == "" {
-			log.Printf("[WARN] wal replay skip entry with empty project")
-			continue
-		}
-		msg := message.AcquireMessage()
-		msg.RequestID = entry.RequestID
-		msg.TraceID = entry.TraceID
-		msg.Project = entry.Project
-		msg.Router = entry.Router
-		msg.Data = entry.Data
-		msg.Timestamp = entry.Timestamp
-		msg.Env = entry.Env
-		if err := disp.DispatchStrict(msg); err != nil {
-			log.Printf("[ERROR] wal replay dispatch failed: %v, request_id=%s", err, msg.RequestID)
-		}
-		replayed++
-	}
-	if err := <-errCh; err != nil {
-		log.Printf("[ERROR] wal replay error: %v", err)
-	}
-	if replayed > 0 {
-		log.Printf("[INFO] WAL replay complete: %d messages replayed", replayed)
-	}
+func messageFromWALEntry(entry wal.Entry) *message.Message {
+	msg := message.AcquireMessage()
+	msg.RequestID = entry.RequestID
+	msg.TraceID = entry.TraceID
+	msg.Project = entry.Project
+	msg.Router = entry.Router
+	msg.Data = entry.Data
+	msg.Timestamp = entry.Timestamp
+	msg.Env = entry.Env
+	return msg
 }
 
 func registerSinkProbes(hc *observability.HealthChecker, disp *project.Dispatcher) {

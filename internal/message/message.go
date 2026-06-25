@@ -55,6 +55,9 @@ func AcquireMessage() *Message {
 }
 
 func ReleaseMessage(msg *Message) {
+	if msg == nil {
+		return
+	}
 	msg.RequestID = ""
 	msg.TraceID = ""
 	msg.Project = ""

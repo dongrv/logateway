@@ -47,6 +47,11 @@ type WorkerPool struct {
 	recoveryOnce sync.Once
 }
 
+const (
+	replayPauseHighWatermark = 0.80
+	replaySlowHighWatermark  = 0.50
+)
+
 type WorkerPoolConfig struct {
 	Sink          Sink
 	Workers       int
@@ -112,36 +117,35 @@ func (wp *WorkerPool) start() {
 
 func (wp *WorkerPool) worker() {
 	defer wp.wg.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[ERROR] sink worker panic: %v", r)
-		}
-	}()
 
 	for {
 		select {
 		case <-wp.ctx.Done():
 			for msg := range wp.ch {
-				wp.processDrain(msg)
+				wp.safeProcess(msg, true)
 			}
 			return
 		case msg, ok := <-wp.ch:
 			if !ok {
 				return
 			}
-			wp.process(msg)
+			wp.safeProcess(msg, false)
 		}
 	}
 }
 
-func (wp *WorkerPool) process(msg *message.Message) {
+func (wp *WorkerPool) safeProcess(msg *message.Message, drain bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[ERROR] sink worker recovered panic: %v, request_id=%s", r, msg.RequestID)
+			wp.handleRejected(msg, "worker_panic")
+		}
+	}()
+	if drain {
+		wp.processWithContext(msg, context.Background())
+		return
+	}
 	wp.processWithContext(msg, wp.ctx)
-}
-
-// processDrain processes messages during shutdown with a background context
-// so that the send timeout is not cancelled by the pool's own shutdown.
-func (wp *WorkerPool) processDrain(msg *message.Message) {
-	wp.processWithContext(msg, context.Background())
 }
 
 func (wp *WorkerPool) processWithContext(msg *message.Message, parentCtx context.Context) {
@@ -235,6 +239,7 @@ func (wp *WorkerPool) Submit(msg *message.Message) error {
 	wp.mu.RUnlock()
 
 	if closed {
+		message.ReleaseMessage(msg)
 		return fmt.Errorf("worker pool closed")
 	}
 
@@ -272,9 +277,18 @@ func (wp *WorkerPool) CircuitOpen() bool {
 
 func (wp *WorkerPool) Name() string       { return wp.sink.Name() }
 func (wp *WorkerPool) SinkInstance() Sink { return wp.sink }
+func (wp *WorkerPool) WorkerCount() int   { return wp.workers }
+
+func (wp *WorkerPool) ChannelCapacity() int {
+	return cap(wp.ch)
+}
 
 func (wp *WorkerPool) ChannelUsage() float64 {
-	return float64(len(wp.ch)) / float64(cap(wp.ch))
+	capacity := cap(wp.ch)
+	if capacity == 0 {
+		return 0
+	}
+	return float64(len(wp.ch)) / float64(capacity)
 }
 
 func (wp *WorkerPool) WALFallbackCount() int64 {
@@ -288,10 +302,15 @@ func (wp *WorkerPool) WALFallbackCount() int64 {
 func (wp *WorkerPool) SubmitStrict(msg *message.Message) error {
 	wp.mu.RLock()
 	closed := wp.closed
+	open := wp.circuitOpen
 	wp.mu.RUnlock()
 	if closed {
 		message.ReleaseMessage(msg)
 		return fmt.Errorf("worker pool closed")
+	}
+	if open {
+		message.ReleaseMessage(msg)
+		return fmt.Errorf("worker pool circuit open")
 	}
 	select {
 	case wp.ch <- msg:
@@ -299,6 +318,40 @@ func (wp *WorkerPool) SubmitStrict(msg *message.Message) error {
 	default:
 		message.ReleaseMessage(msg)
 		return fmt.Errorf("worker pool channel full")
+	}
+}
+
+// CanAcceptReplay reports whether WAL replay should currently enqueue more
+// messages to this pool. It lets normal request traffic keep priority during
+// sustained pressure while preserving WAL segments for the next replay cycle.
+func (wp *WorkerPool) CanAcceptReplay() (bool, time.Duration, string) {
+	wp.mu.RLock()
+	closed := wp.closed
+	open := wp.circuitOpen
+	wp.mu.RUnlock()
+
+	switch {
+	case closed:
+		return false, 0, "worker pool closed"
+	case open:
+		return false, 0, "worker pool circuit open"
+	}
+
+	usage := wp.ChannelUsage()
+	switch {
+	case usage >= replayPauseHighWatermark:
+		return false, 0, fmt.Sprintf("channel usage %.2f exceeds %.2f", usage, replayPauseHighWatermark)
+	case usage >= replaySlowHighWatermark:
+		delay := time.Duration((usage-replaySlowHighWatermark)*1000) * time.Millisecond
+		if delay < 10*time.Millisecond {
+			delay = 10 * time.Millisecond
+		}
+		if delay > 300*time.Millisecond {
+			delay = 300 * time.Millisecond
+		}
+		return true, delay, ""
+	default:
+		return true, 0, ""
 	}
 }
 

@@ -59,13 +59,11 @@ func (d *Dispatcher) Initialize() error {
 func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	var pools []*sink.WorkerPool
 	for i, sr := range projCfg.Sinks {
-		sinkType, mergedCfg := d.resolveSinkConfig(sr)
+		sinkType, workers, channelSize, mergedCfg := d.resolveSinkConfig(sr)
 		sinkName := fmt.Sprintf("%s-%s-%d", projCfg.Name, sinkType, i)
-		workers := sr.Workers
 		if workers <= 0 {
 			workers = readPoolInt(mergedCfg, "workers", 16)
 		}
-		channelSize := sr.ChannelSize
 		if channelSize <= 0 {
 			channelSize = readPoolInt(mergedCfg, "channel_size", 16384)
 		}
@@ -89,12 +87,20 @@ func (d *Dispatcher) initProject(projCfg config.ProjectConfig) error {
 	return nil
 }
 
-func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]interface{}) {
+func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, int, int, map[string]interface{}) {
 	sinkType := ref.Type
+	workers := ref.Workers
+	channelSize := ref.ChannelSize
 	if ref.Instance != "" {
 		instances := d.cfg.Get().SinkInstances
 		if inst, ok := instances[ref.Instance]; ok {
 			sinkType = inst.Type
+			if workers <= 0 {
+				workers = inst.Workers
+			}
+			if channelSize <= 0 {
+				channelSize = inst.ChannelSize
+			}
 		} else {
 			log.Printf("[WARN] sink instance %q not found, falling back to type %q", ref.Instance, ref.Type)
 		}
@@ -118,7 +124,7 @@ func (d *Dispatcher) resolveSinkConfig(ref config.SinkRef) (string, map[string]i
 		merged[k] = v
 	}
 
-	return sinkType, merged
+	return sinkType, workers, channelSize, merged
 }
 
 func (d *Dispatcher) globalSinkDefaults(sinkType string) map[string]interface{} {
@@ -174,20 +180,20 @@ func (d *Dispatcher) SinkInfos() []SinkInfo {
 // Dispatch routes a message to all configured sinks for the project.
 // Uses Submit (may fallback to WAL). Worker pools release the message.
 func (d *Dispatcher) Dispatch(msg *message.Message) error {
-	return d.dispatchImpl(msg, false)
+	return d.dispatchImpl(msg, false, false)
 }
 
 // DispatchStrict is like Dispatch but uses SubmitStrict — it returns an
 // error if any worker pool channel is full, without falling back to WAL.
 // Used by WAL replay to detect backpressure and preserve segment for retry.
 func (d *Dispatcher) DispatchStrict(msg *message.Message) error {
-	return d.dispatchImpl(msg, true)
+	return d.dispatchImpl(msg, true, true)
 }
 
 // dispatchImpl is the single dispatch implementation. When strict is true,
 // SubmitStrict is used; otherwise Submit (with fallback/drop semantics).
 // On error, the message is always released; callers must not release again.
-func (d *Dispatcher) dispatchImpl(msg *message.Message, strict bool) error {
+func (d *Dispatcher) dispatchImpl(msg *message.Message, strict bool, skipPipeline bool) error {
 	if msg == nil {
 		return fmt.Errorf("nil message")
 	}
@@ -208,9 +214,13 @@ func (d *Dispatcher) dispatchImpl(msg *message.Message, strict bool) error {
 		message.ReleaseMessage(msg)
 		return fmt.Errorf("no sinks configured for project %s", msg.Project)
 	}
+	if len(pools) == 0 {
+		message.ReleaseMessage(msg)
+		return fmt.Errorf("no sink pools configured for project %s", msg.Project)
+	}
 
 	projCfg := d.cfg.GetProject(msg.Project)
-	if projCfg != nil && len(projCfg.Pipelines) > 0 {
+	if !skipPipeline && projCfg != nil && len(projCfg.Pipelines) > 0 {
 		chain := d.buildPipelineChain(projCfg)
 		var err error
 		msg, err = chain.Process(msg)
@@ -220,11 +230,8 @@ func (d *Dispatcher) dispatchImpl(msg *message.Message, strict bool) error {
 		}
 	}
 
-	for i, pool := range pools {
-		m := msg
-		if i > 0 {
-			m = copyMessage(msg)
-		}
+	for _, pool := range pools {
+		m := copyMessage(msg)
 		var err error
 		if strict {
 			err = pool.SubmitStrict(m)
@@ -232,14 +239,12 @@ func (d *Dispatcher) dispatchImpl(msg *message.Message, strict bool) error {
 			err = pool.Submit(m)
 		}
 		if err != nil {
-			// Submit/SubmitStrict already released the message on error.
-			// Release remaining copies (i>0) and the original (i==0).
-			if i == 0 {
-				message.ReleaseMessage(msg)
-			}
+			// Submit/SubmitStrict already released the message it received.
+			message.ReleaseMessage(msg)
 			return fmt.Errorf("submit to sink pool: %w", err)
 		}
 	}
+	message.ReleaseMessage(msg)
 	return nil
 }
 
@@ -259,6 +264,40 @@ func copyMessage(src *message.Message) *message.Message {
 		dst.Headers[k] = v
 	}
 	return dst
+}
+
+// ReplayBackoff checks all target pools before WAL replay enqueues an entry.
+// A non-nil error means the segment must be preserved for a later replay cycle.
+func (d *Dispatcher) ReplayBackoff(projectName string) (time.Duration, error) {
+	if projectName == "" {
+		return 0, fmt.Errorf("empty project")
+	}
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	if d.pools == nil {
+		return 0, fmt.Errorf("dispatcher pools not initialized")
+	}
+	pools, ok := d.pools[projectName]
+	if !ok {
+		return 0, fmt.Errorf("no sinks configured for project %s", projectName)
+	}
+	if len(pools) == 0 {
+		return 0, fmt.Errorf("no sink pools configured for project %s", projectName)
+	}
+
+	var maxDelay time.Duration
+	for _, pool := range pools {
+		ok, delay, reason := pool.CanAcceptReplay()
+		if !ok {
+			return 0, fmt.Errorf("replay paused for sink %s: %s", pool.Name(), reason)
+		}
+		if delay > maxDelay {
+			maxDelay = delay
+		}
+	}
+	return maxDelay, nil
 }
 
 func (d *Dispatcher) buildPipelineChain(projCfg *config.ProjectConfig) *pipeline.Chain {

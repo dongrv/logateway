@@ -15,38 +15,58 @@ import (
 type Manager struct {
 	cfg       *config.Manager
 	mu        sync.RWMutex
-	projectRL map[string]*rate.Limiter
+	projectRL map[string]*projectLimiter
 	globalRL  *rate.Limiter
+}
+
+type projectLimiter struct {
+	qps int
+	lim *rate.Limiter
 }
 
 func NewManager(cfg *config.Manager) *Manager {
 	c := cfg.Get()
-	return &Manager{
+	m := &Manager{
 		cfg:       cfg,
-		projectRL: make(map[string]*rate.Limiter),
-		globalRL:  rate.NewLimiter(rate.Limit(c.Server.GlobalRateLimit), c.Server.GlobalRateLimit*2),
+		projectRL: make(map[string]*projectLimiter),
+		globalRL:  newLimiter(c.Server.GlobalRateLimit),
 	}
+	cfg.OnReload(func(c *config.Config) {
+		m.updateGlobalLimiter(c.Server.GlobalRateLimit)
+	})
+	return m
 }
 
 func (m *Manager) GetOrCreateLimiter(project string, qps int) *rate.Limiter {
+	qps = normalizeQPS(qps)
 	m.mu.RLock()
-	lim, ok := m.projectRL[project]
+	entry, ok := m.projectRL[project]
 	m.mu.RUnlock()
-	if ok {
-		return lim
+	if ok && entry.qps == qps {
+		return entry.lim
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if lim, ok := m.projectRL[project]; ok {
-		return lim
+	if entry, ok := m.projectRL[project]; ok {
+		if entry.qps != qps {
+			entry.qps = qps
+			entry.lim.SetLimit(rate.Limit(qps))
+			entry.lim.SetBurst(qps * 2)
+		}
+		return entry.lim
 	}
-	if qps <= 0 {
-		qps = 1000
-	}
-	lim = rate.NewLimiter(rate.Limit(float64(qps)), qps*2)
-	m.projectRL[project] = lim
+	lim := newLimiter(qps)
+	m.projectRL[project] = &projectLimiter{qps: qps, lim: lim}
 	return lim
+}
+
+func (m *Manager) updateGlobalLimiter(qps int) {
+	qps = normalizeQPS(qps)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.globalRL.SetLimit(rate.Limit(qps))
+	m.globalRL.SetBurst(qps * 2)
 }
 
 func (m *Manager) GlobalMiddleware() gin.HandlerFunc {
@@ -100,4 +120,16 @@ func (m *Manager) ProjectMiddleware() gin.HandlerFunc {
 
 func (m *Manager) GlobalLimit() bool {
 	return m.globalRL.Allow()
+}
+
+func newLimiter(qps int) *rate.Limiter {
+	qps = normalizeQPS(qps)
+	return rate.NewLimiter(rate.Limit(qps), qps*2)
+}
+
+func normalizeQPS(qps int) int {
+	if qps <= 0 {
+		return 1000
+	}
+	return qps
 }

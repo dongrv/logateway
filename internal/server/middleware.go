@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -44,6 +46,38 @@ func LoggingMiddleware() gin.HandlerFunc {
 		logJSON("info", "request", requestID, traceID, "",
 			fmt.Sprintf("method=%s path=%s status=%d duration=%s",
 				c.Request.Method, c.Request.URL.Path, c.Writer.Status(), time.Since(start)))
+	}
+}
+
+func BodyCacheMiddleware(cfgMgr *config.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		cfg := cfgMgr.Get()
+		maxBytes := cfg.Server.MaxBodyBytes
+		if maxBytes <= 0 {
+			maxBytes = 1 << 20
+		}
+
+		reader := http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes+1)
+		rawBody, err := io.ReadAll(reader)
+		c.Request.Body.Close()
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, message.UploadResponse{
+				Code:    http.StatusRequestEntityTooLarge,
+				Message: "request body too large",
+			})
+			return
+		}
+		if int64(len(rawBody)) > maxBytes {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, message.UploadResponse{
+				Code:    http.StatusRequestEntityTooLarge,
+				Message: "request body too large",
+			})
+			return
+		}
+
+		c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
+		c.Set("raw_body", rawBody)
+		c.Next()
 	}
 }
 

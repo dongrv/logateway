@@ -236,3 +236,32 @@ func TestMetricsEndpoint(t *testing.T) {
 		t.Error("empty metrics body")
 	}
 }
+
+func TestUploadRejectsBodyOverGlobalLimitBeforeAuth(t *testing.T) {
+	srv := testServer(t)
+	defer srv.Close()
+
+	body := bytes.Repeat([]byte("x"), 1048577)
+	req, _ := http.NewRequest("POST", srv.URL+"/api/v1/log/upload", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+func TestGatewayCloseIsIdempotent(t *testing.T) {
+	gw, err := New("../../configs/gateway.yaml")
+	if err != nil {
+		t.Fatalf("gateway init: %v", err)
+	}
+
+	gw.Close()
+	gw.Close()
+}
