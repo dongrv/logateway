@@ -7,7 +7,7 @@ server:
   ants_pool_size: 10000
   backpressure: fallback
   idle_timeout: 120s
-  env: "production"
+  env: "dev"
 
 auth:
   enabled: true
@@ -47,7 +47,7 @@ projects:
     sinks:
       - type: redis
         config:
-          key: "queue:actilogs"
+          key: "dev:actilogs"
           type: list
           max_len: 1000000
     rate_limit: 10000
@@ -59,14 +59,14 @@ projects:
           mode: exclude
           fields: ["internal_token", "raw_password"]
   # 用法 2: 引用命名实例 + 覆写部分字段
-  - name: blogs
+  - name: pre-actilogs
     enabled: true
     sinks:
       - instance: redis_main
         workers: 16
         channel_size: 65536
         config:
-          key: "queue:blogs"
+          key: "pre:actilogs"
           type: list
           #db: 2 # 覆写实例的 db
     rate_limit: 10000
@@ -91,7 +91,7 @@ log:
   file:
     enabled: true
     dir: "logs"
-    levels: ["info", "error", "warn"]
+    levels: ["error", "warn"]
     max_age: 7
 
 metrics:
